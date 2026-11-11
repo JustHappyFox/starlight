@@ -854,6 +854,18 @@ class MinerClient:
 # =============================================================================
 
 
+def _miner_tls_context() -> ssl.SSLContext:
+    """У веб-морды асика самоподписанный сертификат — как «перейти на сайт (небезопасно)» в браузере."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    except ssl.SSLError:
+        pass
+    return ctx
+
+
 def _norm_key(k: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(k).lower())
 
@@ -1021,17 +1033,10 @@ class WhatsminerWeb:
         self.origin = "%s://%s" % (sp.scheme, sp.netloc)
         self.host = sp.hostname or ""
         self.user, self.password, self.timeout = user, password, timeout
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE  # у асиков самоподписанный сертификат
-        try:
-            ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
-        except ssl.SSLError:
-            pass
         self._jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(self._jar),
-            urllib.request.HTTPSHandler(context=ctx))
+            urllib.request.HTTPSHandler(context=_miner_tls_context()))
         self.prefix: Optional[str] = None  # .../cgi-bin/luci или .../cgi-bin/luci/;stok=...
         self.menu: List[str] = []
         self.status_urls: List[str] = []
@@ -2066,7 +2071,8 @@ def cmd_web_probe(url: str, user: str, password: str, out_path: Optional[str] = 
     jar = http.cookiejar.CookieJar()
     # напрямую, без системных прокси: асик доступен по своему адресу
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
-                                         urllib.request.HTTPCookieProcessor(jar))
+                                         urllib.request.HTTPCookieProcessor(jar),
+                                         urllib.request.HTTPSHandler(context=_miner_tls_context()))
     lines: List[str] = []
     secrets = [x for x in (password,) if x]
 

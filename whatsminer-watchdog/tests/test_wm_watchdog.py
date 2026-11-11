@@ -920,7 +920,7 @@ class FakeWebMiner:
     SID = "f00dfeedf00dfeedf00dfeedf00dfeed"
     TOKEN = "c0ffee00c0ffee00c0ffee00c0ffee00"
 
-    def __init__(self, password="test-pass", reboot_style="old", with_data=True):
+    def __init__(self, password="test-pass", reboot_style="old", with_data=True, tls_cert=None):
         import http.server
         fake = self
         self.password, self.reboot_style, self.with_data = password, reboot_style, with_data
@@ -1024,12 +1024,32 @@ class FakeWebMiner:
                 return self._send(404, "not found")
 
         self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.url = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        scheme = "http"
+        if tls_cert:  # https с самоподписанным сертификатом, как у асиков
+            import ssl
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(*tls_cert)
+            self.srv.socket = ctx.wrap_socket(self.srv.socket, server_side=True)
+            scheme = "https"
+        self.url = "%s://127.0.0.1:%d" % (scheme, self.srv.server_address[1])
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
     def close(self):
         self.srv.shutdown()
         self.srv.server_close()
+
+
+def make_self_signed_cert(directory):
+    """Самоподписанный сертификат через openssl (как у веб-морды асика). None, если openssl нет."""
+    import shutil
+    import subprocess
+    if not shutil.which("openssl"):
+        return None
+    cert, key = os.path.join(directory, "c.pem"), os.path.join(directory, "k.pem")
+    r = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-subj", "/CN=WhatsMiner", "-keyout", key, "-out", cert],
+                       capture_output=True)
+    return (cert, key) if r.returncode == 0 else None
 
 
 class WebClientTests(unittest.TestCase):
@@ -1091,6 +1111,37 @@ class WebClientTests(unittest.TestCase):
         c = wm.WhatsminerWeb("http://127.0.0.1:%d" % closed_port(), "admin", "x", timeout=3)
         with self.assertRaises(wm.Unreachable):
             c.snapshot()
+
+    def test_https_self_signed(self):
+        with tempfile.TemporaryDirectory() as d:
+            cert = make_self_signed_cert(d)
+            if not cert:
+                self.skipTest("нет openssl")
+            self.fake = FakeWebMiner(tls_cert=cert)
+            self.addCleanup(self.fake.close)
+            self.assertTrue(self.fake.url.startswith("https://"))
+            c = wm.WhatsminerWeb(self.fake.url + "/cgi-bin/luci", "admin", "test-pass", timeout=5)
+            snap = c.snapshot()
+            self.assertAlmostEqual(snap.hashrate_ths, 104.1, places=1)
+            c.reboot()
+            self.assertEqual(self.fake.reboots, 1)
+
+    def test_probe_https_self_signed(self):
+        with tempfile.TemporaryDirectory() as d:
+            cert = make_self_signed_cert(d)
+            if not cert:
+                self.skipTest("нет openssl")
+            self.fake = FakeWebMiner(tls_cert=cert)
+            self.addCleanup(self.fake.close)
+            out = os.path.join(d, "probe.txt")
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                wm.cmd_web_probe(self.fake.url, "admin", "test-pass", out)
+            with open(out, encoding="utf-8") as f:
+                report = f.read()
+            self.assertIn("Miner Status", report)
+            self.assertEqual(self.fake.reboots, 0)
 
     def test_duration_parsing(self):
         self.assertEqual(wm._parse_duration("4h 12m 14s"), 15134)
