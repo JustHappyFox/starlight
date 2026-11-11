@@ -113,6 +113,9 @@ class FakeMinerState:
         self.errors = []
         self.boards = [33.3, 33.3, 33.4]
         self.vin = 225.0
+        self.fans = (4500, 4400)
+        self.frozen = False  # асик «завис»: аптайм и хешрейт не меняются
+        self.polls = 0
         self.write_enabled = True
         self.drop_on_reboot = True
         self.commands = []  # принятые привилегированные команды
@@ -149,10 +152,14 @@ def _v2_handler(state):
                 return self.privileged(req)
             cmd = req.get("command") or req.get("cmd")
             if cmd == "summary":
+                if not st.frozen:
+                    st.polls += 1
+                    st.uptime += 60
+                jit = (st.polls % 7) * 1000.0 if st.hashrate_ths else 0.0
                 return {"STATUS": [{"STATUS": "S", "Msg": "Summary"}], "SUMMARY": [{
-                    "Elapsed": st.uptime, "MHS av": st.hashrate_ths * 1e6, "MHS 5s": st.hashrate_ths * 1e6,
-                    "MHS 1m": st.hashrate_ths * 1e6, "Factory GHS": st.factory_ths * 1000, "Power": 3300,
-                    "Env Temp": 25.0}]}
+                    "Elapsed": st.uptime, "MHS av": st.hashrate_ths * 1e6, "MHS 5s": st.hashrate_ths * 1e6 + jit,
+                    "MHS 1m": st.hashrate_ths * 1e6 + jit / 2, "Factory GHS": st.factory_ths * 1000, "Power": 3300,
+                    "Env Temp": 25.0, "Fan Speed In": st.fans[0], "Fan Speed Out": st.fans[1]}]}
             if cmd == "devs":
                 return {"STATUS": [{"STATUS": "S"}],
                         "DEVS": [{"Slot": i, "MHS 1m": b * 1e6} for i, b in enumerate(st.boards)]}
@@ -217,8 +224,13 @@ def _v3_handler(state):
                 return {"code": 0, "msg": {"error-code": [{str(c): "t"} for c in st.errors],
                                            "power": {"vin": st.vin}}}
             if cmd == "get.miner.status" and param == "summary":
-                return {"code": 0, "msg": {"summary": {"elapsed": st.uptime, "hash-realtime": st.hashrate_ths,
-                                                       "factory-hash": st.factory_ths, "power-realtime": 3400}}}
+                if not st.frozen:
+                    st.polls += 1
+                    st.uptime += 60
+                hr = st.hashrate_ths + ((st.polls % 7) * 0.01 if st.hashrate_ths else 0)
+                return {"code": 0, "msg": {"summary": {"elapsed": st.uptime, "hash-realtime": hr,
+                                                       "factory-hash": st.factory_ths, "power-realtime": 3400,
+                                                       "fan-speed-in": st.fans[0], "fan-speed-out": st.fans[1]}}}
             if cmd == "get.miner.status" and param == "edevs":
                 return {"code": 0, "msg": {"edevs": [{"hash-average": b} for b in st.boards]}}
             if cmd.startswith("set."):
@@ -271,9 +283,11 @@ class ProtocolV2Tests(unittest.TestCase):
     def test_snapshot(self):
         self.state.errors = [202, 2010]
         snap = self.client().snapshot()
-        self.assertAlmostEqual(snap.hashrate_ths, 100.0)
+        self.assertAlmostEqual(snap.hashrate_ths, 100.0, places=2)
         self.assertAlmostEqual(snap.expected_ths, 100.0)
-        self.assertEqual(snap.uptime_s, 7200)
+        self.assertEqual(snap.uptime_s, 7260)
+        self.assertEqual((snap.fan_in, snap.fan_out), (4500, 4400))
+        self.assertEqual(len(snap.hr_sig), 2)
         self.assertEqual(snap.errors, [202, 2010])
         self.assertEqual(len(snap.boards_ths), 3)
         self.assertEqual(snap.vin, 225.0)
@@ -325,7 +339,8 @@ class ProtocolV3Tests(unittest.TestCase):
         self.state.errors = [206]
         snap = c.snapshot()
         self.assertEqual(snap.api, "v3")
-        self.assertAlmostEqual(snap.hashrate_ths, 100.0)
+        self.assertAlmostEqual(snap.hashrate_ths, 100.0, places=1)
+        self.assertEqual((snap.fan_in, snap.fan_out), (4500, 4400))
         self.assertEqual(snap.errors, [206])
         self.assertEqual(snap.boards_ths, [33.3, 33.3, 33.4])
         self.assertEqual(snap.vin, 225.0)
@@ -379,26 +394,37 @@ class FakeClock:
 
 
 class FakeClient:
+    """Живой асик: аптайм растёт, хешрейт чуть «гуляет». frozen=True — статистика застыла."""
+
     def __init__(self):
         self.snap = wm.Snapshot(api="v2", hashrate_ths=100, expected_ths=100, uptime_s=7200,
-                                boards_ths=[33, 33, 34])
+                                boards_ths=[33, 33, 34], fan_in=4500, fan_out=4400)
         self.raise_exc = None
         self.calls = []
         self.fail_actions = False
-        self.fix_on = None  # действие, которое «лечит» асик
+        self.reset_on_action = True  # False — «ребут не помог», аптайм не сбрасывается
+        self.frozen = False
+        self.n = 0
 
     def snapshot(self):
         if self.raise_exc:
             raise self.raise_exc
-        return wm.Snapshot(**self.snap.__dict__)
+        if not self.frozen:
+            self.n += 1
+            if self.snap.uptime_s is not None:
+                self.snap.uptime_s += 60
+        snap = wm.Snapshot(**self.snap.__dict__)
+        hr = self.snap.hashrate_ths or 0.0
+        snap.hr_sig = (hr * 1e6 + (self.n % 7) * 1000 if hr else 0.0,)
+        return snap
 
     def _act(self, name):
         self.calls.append(name)
         if self.fail_actions:
             raise wm.ApiError("can't access write cmd")
-        self.snap.uptime_s = 30
-        if self.fix_on == name:
-            self.snap.hashrate_ths = 0
+        if self.reset_on_action:
+            self.snap.uptime_s = 30
+            self.frozen = False
 
     def reboot(self):
         self._act("reboot")
@@ -420,7 +446,8 @@ class CollectNotifier(wm.Notifier):
 
 class WatchdogTests(unittest.TestCase):
     def make(self, **kw):
-        miner_kw = {k: kw.pop(k) for k in list(kw) if k in ("actions", "expected_ths", "min_hashrate_pct")}
+        miner_kw = {k: kw.pop(k) for k in list(kw)
+                    if k in ("actions", "expected_ths", "min_hashrate_pct", "min_fan_rpm", "fault_codes")}
         st = wm.Settings(interval=60, grace_period=900, bad_checks=3, action_cooldown=600,
                          max_actions_per_hour=3, unreachable_checks=5, **kw)
         self.clock = FakeClock()
@@ -489,9 +516,8 @@ class WatchdogTests(unittest.TestCase):
     def test_rate_limit_and_give_up(self):
         self.make()
         self.client.snap.hashrate_ths = 0
-        for _ in range(60):  # час с лишним: перезагрузки не помогают (аптайм не сбрасывается)
-            self.tick(1)
-            self.client.snap.uptime_s = 7200
+        self.client.reset_on_action = False  # перезагрузки не помогают
+        self.tick(60)
         self.assertEqual(len(self.client.calls), 3)
         give_up = [m for m in self.notes.msgs if "⛔" in m]
         self.assertEqual(len(give_up), 1)
@@ -499,20 +525,95 @@ class WatchdogTests(unittest.TestCase):
     def test_escalation_restart_then_reboot(self):
         self.make(actions=["restart", "reboot"])
         self.client.snap.hashrate_ths = 0
-        for _ in range(30):
-            self.tick(1)
-            self.client.snap.uptime_s = 7200
+        self.client.reset_on_action = False
+        self.tick(30)
         self.assertEqual(self.client.calls[:2], ["restart", "reboot"])
 
     def test_crash_loop_in_warmup_is_detected(self):
         self.make()
         self.client.snap.hashrate_ths = 0
-        self.client.snap.uptime_s = 100  # майнер постоянно перезапускается сам
-        self.tick(15)
-        self.assertEqual(self.client.calls, [])
-        self.tick(5)
+        for i in range(20):  # майнер сам перезапускается каждые 5 минут и не хеширует
+            if not self.client.calls:
+                self.client.snap.uptime_s = 30 + 60 * (i % 5)
+            self.tick(1)
+            if i == 14:
+                self.assertEqual(self.client.calls, [])
         self.assertEqual(self.client.calls, ["reboot"])
         self.assertIn("постоянно перезапускается", self.notes.msgs[-1])
+
+    def test_frozen_stats_after_error(self):
+        # асик ушёл в ошибку по БП: на экране последний хешрейт, вентиляторы 250 об/мин
+        self.make()
+        self.tick(3)
+        self.client.frozen = True
+        self.client.snap.errors = [202, 206]
+        self.client.snap.fan_in, self.client.snap.fan_out = 250, 300
+        self.tick(2)
+        self.assertEqual(self.client.calls, [])
+        self.tick(1)  # 3-й плохой опрос подряд — ребут
+        self.assertEqual(self.client.calls, ["reboot"])
+        msg = self.notes.msgs[-1]
+        self.assertIn("майнер завис", msg)
+        self.assertIn("250/300", msg)
+        self.assertIn("206", msg)
+        # после ребута снова живой
+        self.client.snap.errors = []
+        self.client.snap.fan_in, self.client.snap.fan_out = 4500, 4400
+        self.tick(20)
+        self.assertEqual(self.client.calls, ["reboot"])
+        self.assertIn("снова хеширует", self.notes.msgs[-1])
+
+    def test_frozen_hashrate_with_running_uptime(self):
+        self.make()
+        self.tick(2)
+
+        def frozen_hr():
+            self.client.snap.uptime_s += 60
+            return wm.Snapshot(**dict(self.client.snap.__dict__, hr_sig=(1.0e8, 1.0e8)))
+
+        self.client.snapshot = frozen_hr
+        self.tick(5)
+        self.assertEqual(self.client.calls, ["reboot"])
+        self.assertIn("хешрейт не меняется", self.notes.msgs[-1])
+
+    def test_short_interval_does_not_count_as_frozen(self):
+        # при опросе раз в 5 с 5s-хешрейт может не успеть обновиться — это не зависание
+        self.make()
+
+        def live_but_slow_refresh():
+            self.client.snap.uptime_s += 5
+            sig = (1.0e8 + (int(self.clock.t) // 20) * 1000,)
+            return wm.Snapshot(**dict(self.client.snap.__dict__, hr_sig=sig))
+
+        self.client.snapshot = live_but_slow_refresh
+        self.tick(60, step=5)
+        self.assertEqual(self.client.calls, [])
+
+    def test_slow_fans_with_live_looking_hashrate(self):
+        self.make()
+        self.client.snap.fan_in, self.client.snap.fan_out = 250, 280
+        self.tick(3)
+        self.assertEqual(self.client.calls, ["reboot"])
+        self.assertIn("вентиляторы еле крутятся", self.notes.msgs[-1])
+
+    def test_no_fans_hydro_is_ok(self):
+        self.make()
+        self.client.snap.fan_in, self.client.snap.fan_out = 0, 0
+        self.tick(10)
+        self.assertEqual(self.client.calls, [])
+
+    def test_fan_check_can_be_disabled(self):
+        self.make(min_fan_rpm=0)
+        self.client.snap.fan_in, self.client.snap.fan_out = 250, 280
+        self.tick(10)
+        self.assertEqual(self.client.calls, [])
+
+    def test_fault_codes(self):
+        self.make(fault_codes=[206])
+        self.client.snap.errors = [206]
+        self.tick(3)
+        self.assertEqual(self.client.calls, ["reboot"])
+        self.assertIn("fault_codes", self.notes.msgs[-1])
 
     def test_dead_board(self):
         self.make()
@@ -605,6 +706,32 @@ class EndToEndTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_frozen_miner_is_rebooted(self):
+        state = FakeMinerState()
+        srv, port = start_server(_v2_handler(state))
+        try:
+            st = wm.Settings(bad_checks=2, timeout=3)
+            miner = wm.MinerConf(name="m1", host="127.0.0.1", port=port, port_v3=closed_port(),
+                                 password="secret")
+            clock = FakeClock()
+            notes = CollectNotifier()
+            wd = wm.Watchdog(st, [miner], notes, wm.EventLog(""), clock=clock)
+            for _ in range(3):
+                wd.check_all()
+                clock.t += 60
+            self.assertEqual(state.commands, [])  # живой асик не трогаем
+            state.frozen = True
+            state.errors = [206, 202]
+            state.fans = (250, 300)
+            for _ in range(4):
+                wd.check_all()
+                clock.t += 60
+            self.assertEqual([c["cmd"] for c in state.commands], ["reboot"])
+            self.assertIn("майнер завис", notes.msgs[-1])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 class ConfigTests(unittest.TestCase):
     def test_load(self):
@@ -625,6 +752,8 @@ asic-02 = 192.168.1.102
 
 [miner:asic-02]
 password = p#ss;word
+fault_codes = 206, 202
+min_fan_rpm = 0
 expected_ths = 110
 enabled = no
 
@@ -647,6 +776,9 @@ api = v3
         self.assertEqual(by["asic-01"].actions, ["restart", "reboot"])
         self.assertEqual(by["asic-02"].password, "p#ss;word")
         self.assertEqual(by["asic-02"].expected_ths, 110)
+        self.assertEqual(by["asic-02"].fault_codes, [206, 202])
+        self.assertEqual(by["asic-02"].min_fan_rpm, 0)
+        self.assertEqual(by["asic-01"].min_fan_rpm, 600)
         self.assertFalse(by["asic-02"].enabled)
         self.assertEqual(by["asic-03"].api, "v3")
         self.assertEqual(by["asic-03"].host, "192.168.1.103")

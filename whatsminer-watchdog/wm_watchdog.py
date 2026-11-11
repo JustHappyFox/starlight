@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger("wm_watchdog")
 
@@ -538,6 +538,11 @@ class Snapshot:
     power_w: Optional[float] = None
     env_temp: Optional[float] = None
     vin: Optional[float] = None  # входное напряжение БП, В
+    fan_in: Optional[float] = None  # обороты вентиляторов, об/мин
+    fan_out: Optional[float] = None
+    # «сырые» короткие значения хешрейта (5s/1m). У живого майнера они меняются каждый опрос;
+    # если не меняются — статистика зависла на последнем значении.
+    hr_sig: Tuple = ()
     boards_ths: List[float] = field(default_factory=list)
     errors: List[int] = field(default_factory=list)
     read_error: Optional[str] = None
@@ -613,6 +618,9 @@ class WhatsminerV2:
         snap.uptime_s = None if up is None else int(up)
         snap.power_w = _to_float(s.get("Power"))
         snap.env_temp = _to_float(s.get("Env Temp"))
+        snap.fan_in = _to_float(s.get("Fan Speed In"))
+        snap.fan_out = _to_float(s.get("Fan Speed Out"))
+        snap.hr_sig = tuple(_to_float(s.get(k)) for k in ("MHS 5s", "MHS 1m") if k in s)
         errors = set()
         try:
             cnt = int(s.get("Error Code Count") or 0)
@@ -723,6 +731,9 @@ class WhatsminerV3:
         snap.uptime_s = None if up is None else int(up)
         snap.power_w = _to_float(s.get("power-realtime"))
         snap.env_temp = _to_float(s.get("environment-temperature"))
+        snap.fan_in = _to_float(s.get("fan-speed-in"))
+        snap.fan_out = _to_float(s.get("fan-speed-out"))
+        snap.hr_sig = (snap.hashrate_ths,) if "hash-realtime" in s else ()
         try:
             em = self.read("get.miner.status", "edevs").get("msg")
             for b in (em.get("edevs") or []) if isinstance(em, dict) else []:
@@ -823,6 +834,8 @@ class MinerConf:
     expected_ths: Optional[float] = None
     min_hashrate_pct: float = 50.0
     check_dead_boards: bool = True
+    min_fan_rpm: float = 600.0
+    fault_codes: List[int] = field(default_factory=list)
     actions: List[str] = field(default_factory=lambda: ["reboot"])
     enabled: bool = True
 
@@ -833,6 +846,7 @@ class Settings:
     timeout: float = 10.0
     grace_period: int = 900
     bad_checks: int = 3
+    stale_checks: int = 2
     action_cooldown: int = 600
     max_actions_per_hour: int = 3
     unreachable_checks: int = 5
@@ -851,7 +865,7 @@ class Settings:
 
 VALID_ACTIONS = ("restart", "reboot", "hook")
 MINER_KEYS = ("host", "api", "password", "password_v3", "port", "port_v3", "expected_ths",
-              "min_hashrate_pct", "check_dead_boards", "actions", "enabled")
+              "min_hashrate_pct", "check_dead_boards", "min_fan_rpm", "fault_codes", "actions", "enabled")
 
 
 class ConfigError(Exception):
@@ -890,8 +904,10 @@ def _apply_miner_opts(mc: MinerConf, sect: configparser.SectionProxy, where: str
             setattr(mc, key, _parse_num(v, k))
         elif key == "expected_ths":
             mc.expected_ths = _parse_num(v, k, float) if v else None
-        elif key == "min_hashrate_pct":
-            mc.min_hashrate_pct = _parse_num(v, k, float)
+        elif key in ("min_hashrate_pct", "min_fan_rpm"):
+            setattr(mc, key, _parse_num(v, k, float))
+        elif key == "fault_codes":
+            mc.fault_codes = [_parse_num(x, k) for x in v.replace(";", ",").split(",") if x.strip()]
         elif key in ("check_dead_boards", "enabled"):
             setattr(mc, key, _parse_bool(v, k))
         elif key == "actions":
@@ -913,7 +929,7 @@ def load_config(path: str) -> Tuple[Settings, List[MinerConf]]:
     base_dir = os.path.dirname(os.path.abspath(path))
     if cp.has_section("watchdog"):
         w = cp["watchdog"]
-        ints = ("interval", "grace_period", "bad_checks", "action_cooldown", "max_actions_per_hour",
+        ints = ("interval", "grace_period", "bad_checks", "stale_checks", "action_cooldown", "max_actions_per_hour",
                 "unreachable_checks", "hook_cooldown", "workers")
         for key in ints:
             if key in w:
@@ -1092,6 +1108,10 @@ class MinerWatch:
     incident_errors: set = field(default_factory=set)
     last_snapshot: Optional[Snapshot] = None
     warned_no_hashrate: bool = False
+    prev_sig: Tuple = ()
+    prev_uptime: Optional[int] = None
+    prev_time: Optional[float] = None
+    stale_count: int = 0
 
 
 def run_hook(template: str, conf: MinerConf, timeout: int = 120) -> Tuple[bool, str]:
@@ -1168,6 +1188,13 @@ class Watchdog:
         if snap.read_error:
             return "bad", ["API ответило ошибкой: %s" % snap.read_error]
         hr = snap.hashrate_ths
+
+        # 1) Зависшая статистика: асик ушёл в ошибку, а API продолжает отдавать последний
+        #    хешрейт. У живого майнера аптайм растёт, а 5s/1m-хешрейт меняется каждый опрос.
+        frozen = self._frozen_reason(w, snap, now)
+        if frozen:
+            return "bad", [frozen]
+
         if hr is not None and hr >= ZERO_THS:
             w.nohash_since = None
         elif hr is not None and w.nohash_since is None:
@@ -1179,11 +1206,20 @@ class Watchdog:
                 return "bad", ["не хеширует уже %s (майнер постоянно перезапускается)" % fmt_dur(now - w.nohash_since)]
             return "warmup", []
         problems: List[str] = []
+        fans = [f for f in (snap.fan_in, snap.fan_out) if f]
+        if c.min_fan_rpm > 0 and fans and max(fans) < c.min_fan_rpm:
+            # при майнинге вентиляторы крутятся на тысячи оборотов; 200–300 об/мин —
+            # платы стоят (БП отключил выход), даже если хешрейт на экране «живой»
+            problems.append("вентиляторы еле крутятся (%s об/мин) — платы, похоже, стоят" %
+                            "/".join("%.0f" % f for f in fans))
+        hit = [code for code in snap.errors if code in c.fault_codes]
+        if hit:
+            problems.append("есть ошибка из fault_codes: %s" % format_errors(hit))
         if hr is None:
             if not w.warned_no_hashrate:
                 w.warned_no_hashrate = True
                 log.warning("%s: асик не отдаёт хешрейт — следить за ним по хешрейту не получится", c.name)
-            return "ok", []
+            return ("bad" if problems else "ok"), problems
         if hr < ZERO_THS:
             problems.append("хешрейт 0")
         else:
@@ -1195,6 +1231,25 @@ class Watchdog:
                 if dead:
                     problems.append("не хешируют платы в слотах %s" % ", ".join(dead))
         return ("bad" if problems else "ok"), problems
+
+    def _frozen_reason(self, w: MinerWatch, snap: Snapshot, now: float) -> Optional[str]:
+        gap = None if w.prev_time is None else now - w.prev_time
+        sig_same = bool(snap.hr_sig) and any(snap.hr_sig) and snap.hr_sig == w.prev_sig
+        up_same = snap.uptime_s is not None and snap.uptime_s == w.prev_uptime
+        # 5s-хешрейт обновляется раз в несколько секунд — сравниваем только редкие опросы
+        if gap is not None and gap >= 20 and (sig_same or up_same):
+            w.stale_count += 1
+        elif gap is None or gap >= 20:
+            w.stale_count = 0
+        if gap is None or gap >= 20:
+            w.prev_sig, w.prev_uptime, w.prev_time = snap.hr_sig, snap.uptime_s, now
+        if self.s.stale_checks > 0 and w.stale_count >= self.s.stale_checks:
+            what = "аптайм" if up_same and not sig_same else "хешрейт"
+            fans = [f for f in (snap.fan_in, snap.fan_out) if f]
+            fan_txt = ", вентиляторы %s об/мин" % "/".join("%.0f" % f for f in fans) if fans else ""
+            return "майнер завис: %s не меняется %d опроса подряд (на экране %s TH/s%s)" % (
+                what, w.stale_count + 1, fmt_ths(snap.hashrate_ths), fan_txt)
+        return None
 
     def _on_reachable(self, w: MinerWatch, now: float, snap: Snapshot) -> None:
         c = w.conf
@@ -1436,8 +1491,8 @@ def cmd_status(st: Settings, miners: List[MinerConf]) -> int:
 
     with ThreadPoolExecutor(max_workers=max(1, min(st.workers, len(miners)))) as ex:
         results = list(ex.map(probe, miners))
-    hdr = "%-14s %-15s %-3s %9s %9s %10s %6s %6s  %s" % ("асик", "IP", "API", "TH/s", "норма", "аптайм", "Вт",
-                                                         "вход В", "ошибки")
+    hdr = "%-14s %-15s %-3s %9s %9s %10s %6s %6s %11s  %s" % ("асик", "IP", "API", "TH/s", "норма", "аптайм",
+                                                              "Вт", "вход В", "вент.", "ошибки")
     print(hdr)
     print("-" * len(hdr))
     for m, snap, err in results:
@@ -1448,11 +1503,12 @@ def cmd_status(st: Settings, miners: List[MinerConf]) -> int:
         boards = ""
         if snap.boards_ths:
             boards = " [платы: %s]" % " / ".join("%.0f" % b for b in snap.boards_ths)
-        print("%-14s %-15s %-3s %9s %9s %10s %6s %6s  %s%s" % (
+        fans = "/".join("%.0f" % f for f in (snap.fan_in, snap.fan_out) if f is not None) or "?"
+        print("%-14s %-15s %-3s %9s %9s %10s %6s %6s %11s  %s%s" % (
             m.name, m.host, snap.api, fmt_ths(snap.hashrate_ths), fmt_ths(m.expected_ths or snap.expected_ths),
             fmt_dur(snap.uptime_s) if snap.uptime_s is not None else "?",
             "%.0f" % snap.power_w if snap.power_w is not None else "?",
-            "%.0f" % snap.vin if snap.vin is not None else "?",
+            "%.0f" % snap.vin if snap.vin is not None else "?", fans,
             format_errors(snap.errors, limit=3) if not snap.read_error else "ошибка API: " + snap.read_error,
             boards))
     return 0
