@@ -24,7 +24,10 @@ import argparse
 import base64
 import configparser
 import csv
+import getpass
 import hashlib
+import html.parser
+import http.cookiejar
 import ipaddress
 import json
 import logging
@@ -38,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, deque
@@ -1606,6 +1610,241 @@ def cmd_scan(network: str, timeout: float, workers: int) -> int:
     return 0
 
 
+# =============================================================================
+#  Разведка веб-морды: один раз заходит в веб-интерфейс асика (как ты в браузере),
+#  ничего не нажимает и сохраняет в файл, как устроены страницы (меню, формы,
+#  адреса автообновления). Пароль, cookie и токены в файле скрываются.
+#  Нужно, чтобы научить сторожа работать через веб, когда до API не достучаться.
+# =============================================================================
+
+# Эти адреса разведчик никогда не открывает: по ним асик может что-то сделать.
+_PROBE_DANGER = ("reboot/call", "reboot=", "restart", "reset", "factory", "upgrade", "flash", "logout",
+                 "poweroff", "power_off", "power-off", "backup", "passw", "apply", "save", "delete",
+                 "remove", "/led", "update", "set_", "set.", "/call", "action=", "submit", "commit",
+                 "shutdown", "stop", "start", "kill", "format")
+_PROBE_INTEREST = ("status", "overview", "miner", "btminer", "cgminer", "log", "system", "reboot", "summary",
+                   "pool", "device", "info")
+
+
+def _probe_is_dangerous(url: str) -> bool:
+    u = url.lower()
+    return any(d in u for d in _PROBE_DANGER)
+
+
+class _PageInfo(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.links: List[str] = []
+        self.forms: List[dict] = []
+        self.loose_inputs: List[dict] = []
+        self.script_src: List[str] = []
+        self.inline_js: List[str] = []
+        self.text: List[str] = []
+        self._form: Optional[dict] = None
+        self._in_title = self._in_script = self._in_style = False
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        a = {k: (v or "") for k, v in attrs}
+        if tag == "title":
+            self._in_title = True
+        elif tag == "a" and a.get("href"):
+            self.links.append(a["href"])
+        elif tag == "form":
+            self._form = {"action": a.get("action", ""), "method": a.get("method", "get").lower(), "inputs": []}
+            self.forms.append(self._form)
+        elif tag in ("input", "button", "select", "textarea"):
+            item = {"tag": tag, "type": a.get("type", "").lower(), "name": a.get("name", ""),
+                    "value": a.get("value", ""), "onclick": a.get("onclick", "")}
+            (self._form["inputs"] if self._form is not None else self.loose_inputs).append(item)
+        elif tag == "script":
+            self._in_script = True
+            if a.get("src"):
+                self.script_src.append(a["src"])
+        elif tag == "style":
+            self._in_style = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self._in_title = False
+        elif tag == "form":
+            self._form = None
+        elif tag == "script":
+            self._in_script = False
+        elif tag == "style":
+            self._in_style = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title += data
+        if self._in_script:
+            self.inline_js.append(data)
+            return
+        if self._in_style:
+            return
+        d = " ".join(data.split())
+        if d:
+            self.text.append(d)
+
+
+def cmd_web_probe(url: str, user: str, password: str, out_path: Optional[str] = None) -> int:
+    base = url.strip().rstrip("/")
+    if "://" not in base:
+        base = "http://" + base
+    sp = urllib.parse.urlsplit(base)
+    origin = "%s://%s" % (sp.scheme, sp.netloc)
+    jar = http.cookiejar.CookieJar()
+    # напрямую, без системных прокси: асик доступен по своему адресу
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                         urllib.request.HTTPCookieProcessor(jar))
+    lines: List[str] = []
+    secrets = [x for x in (password,) if x]
+
+    def redact(text: str) -> str:
+        for sec in secrets:
+            text = text.replace(sec, "<пароль>")
+        for c in jar:
+            if c.value and len(c.value) >= 4:
+                text = text.replace(c.value, "<cookie>")
+        text = re.sub(r"(stok=)[0-9A-Za-z]+", r"\1<скрыто>", text)
+        text = re.sub(r"(?i)(token[\"']?\s*[:=]\s*[\"']?)[0-9A-Za-z+/=_-]{6,}", r"\1<скрыто>", text)
+        return text
+
+    def fetch(u: str, data: Optional[bytes] = None):
+        req = urllib.request.Request(u, data=data, headers={"User-Agent": "Mozilla/5.0 wm_watchdog-probe"})
+        try:
+            with opener.open(req, timeout=20) as r:
+                return r.getcode(), r.geturl(), r.headers.get("Content-Type", ""), r.read(500_000)
+        except urllib.error.HTTPError as e:
+            return e.code, u, (e.headers.get("Content-Type", "") if e.headers else ""), (e.read(100_000) if e.fp else b"")
+        except Exception as e:  # noqa: BLE001
+            return None, u, "", ("ошибка: %s" % e).encode()
+
+    visited: set = set()
+
+    def report(label: str, u: str, data: Optional[bytes] = None):
+        visited.add(u)
+        code, final, ctype, body = fetch(u, data)
+        lines.append("=" * 72)
+        lines.append("%s: %s %s" % (label, "POST" if data else "GET", redact(u)))
+        lines.append("  ответ: %s, итоговый адрес: %s, тип: %s, размер: %d" % (code, redact(final), ctype, len(body)))
+        text = body.decode("utf-8", errors="replace")
+        if "html" not in ctype.lower() and not text.lstrip().startswith("<"):
+            lines.append("  содержимое: " + redact(text[:4000]))
+            return None, final
+        pg = _PageInfo()
+        try:
+            pg.feed(text)
+        except Exception as e:  # noqa: BLE001
+            lines.append("  не разобрал HTML: %s" % e)
+        lines.append("  заголовок: %s" % " ".join(pg.title.split()))
+        for f in pg.forms:
+            lines.append("  форма: action=%s method=%s" % (redact(f["action"]), f["method"]))
+            for i in f["inputs"]:
+                hidden = i["type"] == "password" or "token" in i["name"].lower() or "pass" in i["name"].lower()
+                lines.append("    <%s type=%s name=%s value=%s%s>" % (
+                    i["tag"], i["type"], i["name"], "<скрыто>" if hidden else redact(i["value"])[:80],
+                    (" onclick=" + redact(i["onclick"])[:200]) if i["onclick"] else ""))
+        for i in pg.loose_inputs:
+            lines.append("  кнопка/поле вне формы: <%s type=%s name=%s value=%s onclick=%s>" % (
+                i["tag"], i["type"], i["name"], redact(i["value"])[:80], redact(i["onclick"])[:200]))
+        links = list(dict.fromkeys(pg.links))
+        if links:
+            lines.append("  ссылки (%d):" % len(links))
+            for ln in links[:80]:
+                lines.append("    " + redact(ln))
+        js = "\n".join(pg.inline_js)
+        js_urls = list(dict.fromkeys(re.findall(
+            r"""["']((?:https?://[^"'\s]+)?/(?:cgi-bin|api|luci|admin)[^"'\s]*)["']""", js)))
+        if pg.script_src:
+            lines.append("  скрипты: " + ", ".join(redact(x) for x in pg.script_src[:20]))
+        if js_urls:
+            lines.append("  адреса из скриптов: " + ", ".join(redact(x) for x in js_urls[:40]))
+        last_end = -1
+        frags = 0
+        for m in re.finditer(r"(?i)(xhr|poll|ajax|fetch\(|reboot|token|json)", js):
+            if m.start() < last_end or frags >= 12:
+                continue
+            frag = js[max(0, m.start() - 150): m.end() + 250]
+            last_end = m.end() + 250
+            frags += 1
+            lines.append("  фрагмент скрипта: " + redact(" ".join(frag.split()))[:420])
+        if pg.text:
+            lines.append("  текст страницы: " + redact(" | ".join(pg.text))[:4000])
+        pg.links = [urllib.parse.urljoin(final, x) for x in links] + \
+                   [urllib.parse.urljoin(final, x) for x in js_urls]
+        return pg, final
+
+    lines.append("wm_watchdog %s web-probe, %s" % (__version__, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    lines.append("Ничего на асике не нажималось: только вход и просмотр страниц.")
+    p0, f0 = report("Главная", origin + "/")
+    p1, f1 = report("Страница входа", origin + "/cgi-bin/luci")
+
+    form, form_page = None, f1
+    for pg, fin in ((p1, f1), (p0, f0)):
+        for f in (pg.forms if pg else []):
+            if any(i["type"] == "password" for i in f["inputs"]):
+                form, form_page = f, fin
+                break
+        if form:
+            break
+    if form:
+        action = urllib.parse.urljoin(form_page, form["action"] or form_page)
+        fields: Dict[str, str] = {}
+        for i in form["inputs"]:
+            n = i["name"]
+            if not n:
+                continue
+            if i["type"] == "password" or "pass" in n.lower():
+                fields[n] = password
+            elif "user" in n.lower() or "login" in n.lower() or i["type"] in ("text", "email", ""):
+                fields[n] = user if i["tag"] == "input" else i["value"]
+            elif i["type"] == "hidden":
+                fields[n] = i["value"]
+    else:
+        action = origin + "/cgi-bin/luci"
+        fields = {"luci_username": user, "luci_password": password}
+    p2, f2 = report("Вход (логин %s)" % user, action, urllib.parse.urlencode(fields).encode())
+    lines.append("  cookie после входа: %s" % (", ".join(c.name for c in jar) or "нет"))
+    logged_in = bool(list(jar)) or "stok=" in f2
+
+    # обходим страницы меню, сначала самые интересные (статус, логи, перезагрузка)
+    prefix = f2.split("/admin")[0] if "/admin" in f2 else origin + "/cgi-bin/luci"
+    guesses = [prefix + x for x in ("/admin/status/overview", "/admin/status/btminerstatus",
+                                    "/admin/status/cgminerstatus", "/admin/status/minerstatus",
+                                    "/admin/status/syslog", "/admin/status/btminerlog",
+                                    "/admin/system/reboot")]
+    todo: List[str] = []
+    for u in (p2.links if p2 else []) + guesses:
+        u = u.split("#")[0]
+        if not u.startswith(origin) or _probe_is_dangerous(u) or u in todo:
+            continue
+        todo.append(u)
+    todo.sort(key=lambda u: -sum(k in u.lower() for k in _PROBE_INTEREST))
+    pages = 0
+    while todo and pages < 25:
+        u = todo.pop(0)
+        if u in visited:
+            continue
+        pages += 1
+        pg, _ = report("Страница", u)
+        for v in (pg.links if pg else []):
+            v = v.split("#")[0]
+            if v.startswith(origin) and not _probe_is_dangerous(v) and v not in visited and v not in todo:
+                if "?" in v or any(k in v.lower() for k in ("status", "log", "json", "summary")):
+                    todo.insert(0, v)  # адреса автообновления статуса — в приоритет
+
+    out = out_path or "web_probe_%s.txt" % re.sub(r"[^0-9A-Za-z._-]+", "_", sp.netloc)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(redact("\n".join(lines)) + "\n")
+    print("Готово: %s (страниц: %d). Пароль, cookie и токены в файле скрыты." % (os.path.abspath(out), len(visited)))
+    if not logged_in:
+        print("Похоже, войти не удалось — проверь логин/пароль (в файле всё равно есть страница входа).")
+    print("Пришли этот файл мне — по нему я научу сторожа перезагружать асик через веб-морду.")
+    return 0
+
+
+
 def default_config_path() -> str:
     here = os.path.join(os.getcwd(), "config.ini")
     if os.path.exists(here):
@@ -1640,6 +1879,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     sc = sub.add_parser("scan", help="найти асики в сети, напр. scan 192.168.1.0/24")
     sc.add_argument("network")
     sc.add_argument("--timeout", type=float, default=2.0)
+    wp = sub.add_parser("web-probe", help="разведать веб-морду асика (ничего не нажимает), напр. "
+                                          "web-probe http://1.2.3.4:1001")
+    wp.add_argument("url")
+    wp.add_argument("--user", default="admin")
+    wp.add_argument("--password", default=None, help="если не указать — спросит")
+    wp.add_argument("--out", default=None, help="куда сохранить отчёт")
 
     args = p.parse_args(argv)
     cmd = args.cmd or "run"
@@ -1647,6 +1892,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cmd == "scan":
         setup_logging("", args.verbose)
         return cmd_scan(args.network, args.timeout, 64)
+    if cmd == "web-probe":
+        pwd = args.password if args.password is not None else getpass.getpass("Пароль веб-морды: ")
+        return cmd_web_probe(args.url, args.user, pwd, args.out)
 
     cfg_path = args.config or default_config_path()
     try:

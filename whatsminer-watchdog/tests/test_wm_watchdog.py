@@ -798,6 +798,121 @@ class EndToEndTests(unittest.TestCase):
             srv.server_close()
 
 
+class FakeLuci:
+    """Похоже на веб-морду Whatsminer (OpenWrt LuCI): вход, stok, меню, статус с автообновлением."""
+
+    STOK = "abc123def456"
+    SID = "SECRETSESSIONID42"
+    CSRF = "CSRFTOKEN1234567890"
+
+    def __init__(self):
+        import http.server
+        fake = self
+        self.requests = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, body, ctype="text/html", headers=None):
+                data = body.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def authed(self):
+                return ("sysauth=%s" % fake.SID) in (self.headers.get("Cookie") or "")
+
+            def do_GET(self):
+                fake.requests.append(("GET", self.path))
+                pre = "/cgi-bin/luci/;stok=%s" % fake.STOK
+                if self.path == "/":
+                    return self._send(302, "", headers={"Location": "/cgi-bin/luci"})
+                if self.path == "/cgi-bin/luci":
+                    return self._send(200, "<html><head><title>WhatsMiner - LuCI</title></head><body>"
+                                      "<form method='post' action='/cgi-bin/luci'>"
+                                      "<input type='text' name='luci_username' value='admin'>"
+                                      "<input type='password' name='luci_password'>"
+                                      "<input type='submit' value='Login'></form></body></html>")
+                if not self.authed():
+                    return self._send(403, "denied")
+                if self.path == pre + "/admin/status/overview":
+                    return self._send(200, "<html><title>Overview</title><body>"
+                                      "<a href='%s/admin/status/btminerstatus'>Miner Status</a>"
+                                      "<a href='%s/admin/system/reboot'>Reboot</a>"
+                                      "<a href='%s/admin/system/flashops'>Upgrade</a>"
+                                      "<a href='%s/admin/logout'>Logout</a>"
+                                      "<p>Model WhatsMiner M30S++_VH95</p></body></html>" % (pre, pre, pre, pre))
+                if self.path == pre + "/admin/status/btminerstatus":
+                    return self._send(200, "<html><title>Miner Status</title><body><table><tr><td>MHS av</td>"
+                                      "<td>104000000</td></tr></table><script>XHR.poll(5, '%s/admin/status/"
+                                      "btminerstatus?status=1', null, function(x, st) { update(st); });"
+                                      "</script></body></html>" % pre)
+                if self.path == pre + "/admin/status/btminerstatus?status=1":
+                    return self._send(200, '{"summary":{"MHS 5s":"103512345.1","Fan Speed In":"280"},'
+                                      '"error_code":["206"]}', ctype="application/json")
+                if self.path == pre + "/admin/system/reboot":
+                    return self._send(200, "<html><title>Reboot</title><body>"
+                                      "<input type='button' value='Perform reboot' onclick='reboot()'>"
+                                      "<script>var token = '%s'; function reboot(){ (new XHR()).post("
+                                      "'/cgi-bin/luci/admin/system/reboot/call', {token: token}); }</script>"
+                                      "</body></html>" % fake.CSRF)
+                return self._send(404, "not found")
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n).decode()
+                fake.requests.append(("POST", self.path))
+                if self.path == "/cgi-bin/luci" and "luci_password=s3cret%21" in body:
+                    return self._send(302, "", headers={
+                        "Location": "/cgi-bin/luci/;stok=%s/admin/status/overview" % fake.STOK,
+                        "Set-Cookie": "sysauth=%s; path=/" % fake.SID})
+                return self._send(403, "bad login")
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class WebProbeTests(unittest.TestCase):
+    def test_probe_is_safe_and_redacted(self):
+        fake = FakeLuci()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "probe.txt")
+                import contextlib
+                import io
+                with contextlib.redirect_stdout(io.StringIO()):
+                    wm.cmd_web_probe(fake.url, "admin", "s3cret!", out)
+                with open(out, encoding="utf-8") as f:
+                    report = f.read()
+        finally:
+            fake.close()
+        paths = [p for _, p in fake.requests]
+        # нашёл статус, адрес автообновления и страницу перезагрузки
+        self.assertIn("Miner Status", report)
+        self.assertIn("btminerstatus?status=1", report)
+        self.assertIn("Fan Speed In", report)
+        self.assertIn("reboot/call", report)  # адрес кнопки записан...
+        self.assertTrue(any(p.endswith("btminerstatus?status=1") for p in paths))
+        # ...но опасные адреса никогда не открывались
+        for p in paths:
+            self.assertNotIn("reboot/call", p)
+            self.assertNotIn("flashops", p)
+            self.assertNotIn("logout", p)
+        # секреты скрыты
+        for secret in ("s3cret!", FakeLuci.SID, FakeLuci.STOK, FakeLuci.CSRF):
+            self.assertNotIn(secret, report)
+
+
 class ConfigTests(unittest.TestCase):
     def test_load(self):
         ini = """
