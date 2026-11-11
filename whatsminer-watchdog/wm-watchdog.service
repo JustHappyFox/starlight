@@ -1,0 +1,20 @@
+# systemd-юнит для wm_watchdog.
+# Поправь User и пути (WorkingDirectory/ExecStart), затем:
+#   sudo cp wm-watchdog.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wm-watchdog
+[Unit]
+Description=Whatsminer watchdog (auto-reboot fallen ASICs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/whatsminer-watchdog
+ExecStart=/usr/bin/python3 /home/pi/whatsminer-watchdog/wm_watchdog.py -c /home/pi/whatsminer-watchdog/config.ini run
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

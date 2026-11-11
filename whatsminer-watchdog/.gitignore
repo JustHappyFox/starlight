@@ -1,0 +1,5 @@
+config.ini
+*.log
+*.log.*
+wm_events.csv
+__pycache__/
