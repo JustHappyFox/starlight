@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 log = logging.getLogger("wm_watchdog")
 
@@ -773,17 +773,23 @@ class WhatsminerV3:
 
 
 class MinerClient:
-    """Сам выбирает API v2 или v3 и запоминает, какой ответил."""
+    """Сам выбирает API и запоминает, какой ответил.
+
+    Сначала пробуем v3 (порт 4433): он есть только на новых прошивках (примерно с конца
+    2024), и на них старый порт 4028 часто ещё отвечает на чтение, но команды записи
+    принимает уже только v3. На старых прошивках 4433 закрыт — сразу уходим на v2.
+    Если команда не прошла по одному API, пробуем другой.
+    """
 
     def __init__(self, host: str, api: str = "auto", password: str = "admin", password_v3: str = "super",
                  port: int = 4028, port_v3: int = 4433, timeout: float = 10.0):
         self.v2 = WhatsminerV2(host, port, password, timeout) if api in ("auto", "v2") else None
         self.v3 = WhatsminerV3(host, port_v3, password_v3, timeout) if api in ("auto", "v3") else None
-        self.active = self.v2 or self.v3
+        self.active = self.v3 or self.v2
 
     def _order(self) -> list:
         out = []
-        for c in (self.active, self.v2, self.v3):
+        for c in (self.active, self.v3, self.v2):
             if c is not None and c not in out:
                 out.append(c)
         return out
@@ -801,20 +807,31 @@ class MinerClient:
             raise errors[0]
         raise Unreachable("; ".join(str(e) for e in errors))
 
+    def _action(self, name: str, *args: object) -> dict:
+        errors: List[str] = []
+        for c in self._order():
+            try:
+                r = getattr(c, name)(*args)
+                self.active = c
+                return r
+            except ApiError as e:
+                errors.append("API %s: %s" % (c.api, e))
+        raise ApiError("; ".join(errors))
+
     def reboot(self) -> dict:
-        return self.active.reboot()
+        return self._action("reboot")
 
     def restart(self) -> dict:
-        return self.active.restart()
+        return self._action("restart")
 
     def check_auth(self) -> dict:
-        return self.active.check_auth()
+        return self._action("check_auth")
 
     def power_limit(self, watts: int) -> dict:
-        return self.active.power_limit(watts)
+        return self._action("power_limit", watts)
 
     def power_mode(self, mode: str) -> dict:
-        return self.active.power_mode(mode)
+        return self._action("power_mode", mode)
 
 
 # =============================================================================
@@ -852,6 +869,8 @@ class Settings:
     unreachable_checks: int = 5
     on_unreachable: str = ""
     hook_cooldown: int = 1800
+    min_vin: float = 0.0
+    max_vin_wait: int = 3600
     workers: int = 16
     dry_run: bool = False
     log_file: str = "wm_watchdog.log"
@@ -930,12 +949,14 @@ def load_config(path: str) -> Tuple[Settings, List[MinerConf]]:
     if cp.has_section("watchdog"):
         w = cp["watchdog"]
         ints = ("interval", "grace_period", "bad_checks", "stale_checks", "action_cooldown", "max_actions_per_hour",
-                "unreachable_checks", "hook_cooldown", "workers")
+                "unreachable_checks", "hook_cooldown", "max_vin_wait", "workers")
         for key in ints:
             if key in w:
                 setattr(st, key, _parse_num(w[key], "[watchdog] " + key))
         if "timeout" in w:
             st.timeout = _parse_num(w["timeout"], "[watchdog] timeout", float)
+        if w.get("min_vin", "").strip():
+            st.min_vin = _parse_num(w["min_vin"], "[watchdog] min_vin", float)
         for key in ("on_unreachable", "log_file", "events_file"):
             if key in w:
                 setattr(st, key, w[key].strip())
@@ -1112,6 +1133,7 @@ class MinerWatch:
     prev_uptime: Optional[int] = None
     prev_time: Optional[float] = None
     stale_count: int = 0
+    vin_wait_since: Optional[float] = None
 
 
 def run_hook(template: str, conf: MinerConf, timeout: int = 120) -> Tuple[bool, str]:
@@ -1278,6 +1300,7 @@ class Watchdog:
             w.limit_alerted = w.fail_alerted = False
             w.incident_start, w.incident_actions = None, 0
             w.incident_errors = set()
+            w.vin_wait_since = None
             return
 
         # status == "bad"
@@ -1290,6 +1313,22 @@ class Watchdog:
             self.events.write(c, "fault", reason, snap, now)
         if w.bad_count < self.s.bad_checks:
             return
+        # Просадка в сети: пока на входе меньше min_vin, БП после перезагрузки снова уйдёт
+        # в защиту (ошибка 206). Ждём, когда напряжение вернётся, и только тогда ребутим.
+        if self.s.min_vin > 0 and snap.vin is not None and 100 < snap.vin < self.s.min_vin:
+            if w.vin_wait_since is None:
+                w.vin_wait_since = now
+                self.notifier.send(
+                    "⚡ %s (%s): %s. На входе БП %.0f В — ниже %g В. Перезагружать сейчас бесполезно, "
+                    "жду, когда напряжение поднимется. Ошибки: %s" % (
+                        c.name, c.host, reason, snap.vin, self.s.min_vin, format_errors(snap.errors)))
+                self.events.write(c, "low_voltage_wait", reason, snap, now)
+            if now - w.vin_wait_since < self.s.max_vin_wait:
+                return
+            reason += "; напряжение так и не поднялось за %s — пробую всё равно" % fmt_dur(now - w.vin_wait_since)
+        elif w.vin_wait_since is not None:
+            reason += "; напряжение вернулось (%s В, ждал %s)" % (fmt_ths(snap.vin).replace(".0", ""),
+                                                                fmt_dur(now - w.vin_wait_since))
         if now - w.last_action < self.s.action_cooldown:
             return
         while w.action_times and now - w.action_times[0] >= 3600:
@@ -1314,6 +1353,7 @@ class Watchdog:
         w.incident_actions += 1
         w.bad_count = 0
         w.nohash_since = now  # отсчёт «не хеширует» заново — после действия ему нужно время
+        w.vin_wait_since = None
         errs = format_errors(snap.errors)
         vin = " Вход БП: %.0f В." % snap.vin if snap.vin is not None else ""
         head = "%s (%s): %s. Ошибки: %s.%s" % (c.name, c.host, reason, errs, vin)

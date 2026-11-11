@@ -355,6 +355,43 @@ class ProtocolV3Tests(unittest.TestCase):
             c.reboot()
 
 
+class BothApisTests(unittest.TestCase):
+    """Новая прошивка: открыты оба порта, а запись может работать только по одному API."""
+
+    def setUp(self):
+        self.s2, self.s3 = FakeMinerState(), FakeMinerState()
+        self.s2.password, self.s3.password = "secret", "super"
+        self.srv2, self.p2 = start_server(_v2_handler(self.s2))
+        self.srv3, self.p3 = start_server(_v3_handler(self.s3))
+
+    def tearDown(self):
+        for srv in (self.srv2, self.srv3):
+            srv.shutdown()
+            srv.server_close()
+
+    def test_prefers_v3(self):
+        c = wm.MinerClient("127.0.0.1", port=self.p2, port_v3=self.p3, password="secret", timeout=3)
+        self.assertEqual(c.snapshot().api, "v3")
+        c.reboot()
+        self.assertEqual([x["cmd"] for x in self.s3.commands], ["set.system.reboot"])
+        self.assertEqual(self.s2.commands, [])
+
+    def test_action_falls_back_to_other_api(self):
+        self.s3.password = "changed"  # v3 не пускает — должен сработать v2
+        c = wm.MinerClient("127.0.0.1", port=self.p2, port_v3=self.p3, password="secret", timeout=3)
+        c.snapshot()
+        c.reboot()
+        self.assertEqual([x["cmd"] for x in self.s2.commands], ["reboot"])
+
+    def test_both_fail_reports_both(self):
+        self.s3.password = "changed"
+        c = wm.MinerClient("127.0.0.1", port=self.p2, port_v3=self.p3, password="wrong", timeout=3)
+        with self.assertRaises(wm.ApiError) as cm:
+            c.reboot()
+        self.assertIn("API v3", str(cm.exception))
+        self.assertIn("API v2", str(cm.exception))
+
+
 class ParsingTests(unittest.TestCase):
     def test_broken_error_code_list(self):
         raw = b'{"STATUS":"S","When":1,"Code":133,"Msg":{"error_code":["110":"2021-01-01","203":"2021-01-01"]},' \
@@ -615,6 +652,34 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.client.calls, ["reboot"])
         self.assertIn("fault_codes", self.notes.msgs[-1])
 
+    def test_low_voltage_waits_then_reboots(self):
+        # как в реальном логе: 206, vin 199.75 В — ребутить бесполезно, пока сеть не поднимется
+        self.make(min_vin=205)
+        self.client.frozen = True
+        self.client.snap.errors = [206]
+        self.client.snap.fan_in, self.client.snap.fan_out = 250, 300
+        self.client.snap.vin = 199.75
+        self.tick(20)
+        self.assertEqual(self.client.calls, [])
+        waits = [m for m in self.notes.msgs if "⚡" in m]
+        self.assertEqual(len(waits), 1)
+        self.assertIn("200 В", waits[0])
+        self.client.snap.vin = 218.0  # напряжение вернулось
+        self.tick(1)
+        self.assertEqual(self.client.calls, ["reboot"])
+        self.assertIn("напряжение вернулось", self.notes.msgs[-1])
+        self.assertIn("low_voltage_wait", self.events_list())
+
+    def test_low_voltage_wait_is_capped(self):
+        self.make(min_vin=205, max_vin_wait=1800)
+        self.client.snap.hashrate_ths = 0
+        self.client.snap.vin = 199.0
+        self.tick(30)
+        self.assertEqual(self.client.calls, [])
+        self.tick(5)
+        self.assertEqual(self.client.calls, ["reboot"])
+        self.assertIn("так и не поднялось", self.notes.msgs[-1])
+
     def test_dead_board(self):
         self.make()
         self.client.snap.hashrate_ths = 66
@@ -739,6 +804,7 @@ class ConfigTests(unittest.TestCase):
 [watchdog]
 interval = 30
 password = pw1
+min_vin = 205
 actions = restart, reboot
 
 [telegram]
@@ -767,6 +833,7 @@ api = v3
                 f.write(ini)
             st, miners = wm.load_config(p)
         self.assertEqual(st.interval, 30)
+        self.assertEqual(st.min_vin, 205)
         self.assertEqual(st.telegram_token, "123:ABC")
         self.assertEqual(st.daily_report_hour, 9)
         self.assertTrue(st.events_file.endswith("wm_events.csv"))
