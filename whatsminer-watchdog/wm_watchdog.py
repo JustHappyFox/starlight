@@ -27,6 +27,7 @@ import csv
 import getpass
 import hashlib
 import html.parser
+import http.client
 import http.cookiejar
 import ipaddress
 import json
@@ -36,6 +37,7 @@ import os
 import queue
 import re
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -50,7 +52,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 log = logging.getLogger("wm_watchdog")
 
@@ -423,6 +425,10 @@ class NoReply(ApiError):
     """Подключились, но ответа нет (обрыв или таймаут)."""
 
 
+class NoData(ApiError):
+    """Асик ответил, но нужных цифр в ответе не нашли. Это не повод его перезагружать."""
+
+
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = b""
     while len(buf) < n:
@@ -786,14 +792,17 @@ class MinerClient:
     """
 
     def __init__(self, host: str, api: str = "auto", password: str = "admin", password_v3: str = "super",
-                 port: int = 4028, port_v3: int = 4433, timeout: float = 10.0):
+                 port: int = 4028, port_v3: int = 4433, timeout: float = 10.0, web_url: str = "",
+                 web_user: str = "admin", web_password: Optional[str] = None):
         self.v2 = WhatsminerV2(host, port, password, timeout) if api in ("auto", "v2") else None
         self.v3 = WhatsminerV3(host, port_v3, password_v3, timeout) if api in ("auto", "v3") else None
-        self.active = self.v3 or self.v2
+        self.web = WhatsminerWeb(web_url, web_user, password if web_password is None else web_password,
+                                 timeout=max(timeout, 20.0)) if web_url and api in ("auto", "web") else None
+        self.active = self.v3 or self.v2 or self.web
 
     def _order(self) -> list:
         out = []
-        for c in (self.active, self.v3, self.v2):
+        for c in (self.active, self.v3, self.v2, self.web):
             if c is not None and c not in out:
                 out.append(c)
         return out
@@ -839,6 +848,332 @@ class MinerClient:
 
 
 # =============================================================================
+#  Веб-морда (OpenWrt LuCI, как в браузере). Для точек, где наружу проброшена
+#  только морда, а порты API — нет. Работает и по http, и по https с самоподписанным
+#  сертификатом (как у асиков: браузер на него ругается, но пускает).
+# =============================================================================
+
+
+def _norm_key(k: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(k).lower())
+
+
+def _parse_duration(v: object) -> Optional[int]:
+    """Аптайм: 15012, '4h 12m 14s', '0d 4h 12m', '04:12:14', '1 день 2 ч 3 мин'."""
+    x = _to_float(v)
+    if x is not None:
+        return int(x)
+    s = str(v).strip().lower()
+    m = re.search(r"(?:(\d+)\s*d\w*\s*)?(\d+):(\d{2}):(\d{2})", s)
+    if m:
+        return int(m.group(1) or 0) * 86400 + int(m.group(2)) * 3600 + int(m.group(3)) * 60 + int(m.group(4))
+    mult = {"d": 86400, "д": 86400, "h": 3600, "ч": 3600, "m": 60, "м": 60, "s": 1, "с": 1}
+    total, found = 0, False
+    for num, unit in re.findall(r"(\d+)\s*([dhmsдчмс])", s):
+        total += int(num) * mult[unit]
+        found = True
+    return total if found else None
+
+
+class _TableParser(html.parser.HTMLParser):
+    """Достаёт из страницы все таблицы (в т.ч. LuCI-шные div.tr/div.td) и признак формы входа."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: List[List[List[str]]] = []
+        self.has_password = False
+        self._tables: List[List[List[str]]] = []
+        self._row: Optional[List[str]] = None
+        self._cell: Optional[List[str]] = None
+        self._divs: List[str] = []
+
+    def _kind(self, tag: str, attrs: list) -> str:
+        if tag in ("table", "tr", "td", "th"):
+            return tag
+        if tag == "div":
+            cls = " ".join(v or "" for k, v in attrs if k == "class").split()
+            for c in ("table", "tr", "td", "th"):
+                if c in cls:
+                    return c
+        return ""
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag == "input" and any(k == "type" and (v or "").lower() == "password" for k, v in attrs):
+            self.has_password = True
+        kind = self._kind(tag, attrs)
+        if tag == "div":
+            self._divs.append(kind)
+        if kind == "table":
+            self._tables.append([])
+        elif kind == "tr" and self._tables:
+            self._row = []
+        elif kind in ("td", "th") and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        kind = tag if tag in ("table", "tr", "td", "th") else (self._divs.pop() if tag == "div" and self._divs else "")
+        if kind in ("td", "th") and self._cell is not None and self._row is not None:
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif kind == "tr" and self._row is not None:
+            if self._row and self._tables:
+                self._tables[-1].append(self._row)
+            self._row = None
+        elif kind == "table" and self._tables:
+            self.tables.append(self._tables.pop())
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def _tables_to_data(tables: List[List[List[str]]], kv: Dict[str, str], rows: List[Dict[str, str]]) -> None:
+    for t in tables:
+        if not t:
+            continue
+        if all(len(r) == 2 for r in t):  # «параметр | значение»
+            for k, v in t:
+                kv.setdefault(_norm_key(k), v)
+            continue
+        head, data = t[0], [r for r in t[1:] if len(r) == len(t[0])]
+        if len(head) < 2 or not data:
+            continue
+        dicts = [{_norm_key(h): c for h, c in zip(head, r)} for r in data]
+        if len(dicts) == 1:
+            for k, v in dicts[0].items():
+                kv.setdefault(k, v)
+        rows.extend(dicts)
+
+
+def _json_to_data(obj: object, kv: Dict[str, str], rows: List[Dict[str, str]]) -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                _json_to_data(v, kv, rows)
+            else:
+                kv.setdefault(_norm_key(k), str(v))
+        if any(not isinstance(v, (dict, list)) for v in obj.values()):
+            rows.append({_norm_key(k): str(v) for k, v in obj.items() if not isinstance(v, (dict, list))})
+    elif isinstance(obj, list):
+        for v in obj:
+            _json_to_data(v, kv, rows)
+
+
+def _snapshot_from_data(kv: Dict[str, str], rows: List[Dict[str, str]]) -> Snapshot:
+    snap = Snapshot(api="web")
+
+    def num(*keys: str) -> Optional[float]:
+        for k in keys:
+            m = re.search(r"-?\d+(?:\.\d+)?", kv.get(k, "").replace(",", "."))
+            if m:
+                return float(m.group(0))
+        return None
+
+    mhs = num("mhs1m", "mhs5s", "mhsav")
+    ghs = num("ghs1m", "ghs5s", "ghsav")
+    ths = num("ths1m", "ths5s", "thsav", "hashrealtime")
+    snap.hashrate_ths = mhs / 1e6 if mhs is not None else ghs / 1e3 if ghs is not None else ths
+    snap.hr_sig = tuple(_to_float(re.sub(r"[^0-9.]", "", kv.get(k, ""))) for k in ("mhs5s", "mhs1m", "ghs5s")
+                        if k in kv)
+    for key in ("elapsed", "uptime"):
+        if key in kv:
+            snap.uptime_s = _parse_duration(kv[key])
+            if snap.uptime_s is not None:
+                break
+    fghs = num("factoryghs")
+    snap.expected_ths = fghs / 1000 if fghs else None
+    snap.fan_in = num("fanspeedin", "fanin")
+    snap.fan_out = num("fanspeedout", "fanout")
+    snap.power_w = num("power")
+    snap.env_temp = num("envtemp")
+    v = num("vin", "inputvoltage")
+    snap.vin = _volts(v) if v is not None else None
+    errs = []
+    for k, val in kv.items():
+        if k.startswith("errorcode") and k != "errorcodecount":
+            errs.extend(int(x) for x in re.findall(r"\b\d{3,6}\b", val))
+    snap.errors = sorted(set(errs))
+    for r in rows:  # платы: строки, где есть слот/номер и хешрейт, но нет адреса пула
+        if "url" in r or not any(k in r for k in ("slot", "asc", "id", "name")):
+            continue
+        for key, div in (("mhs1m", 1e6), ("mhs5s", 1e6), ("mhsav", 1e6), ("ghs5s", 1e3), ("ghsav", 1e3)):
+            if key in r:
+                m = re.search(r"\d+(?:\.\d+)?", r[key])
+                snap.boards_ths.append(float(m.group(0)) / div if m else 0.0)
+                break
+    if snap.hashrate_ths is None and snap.uptime_s is None:
+        raise NoData("в веб-морде не нашёл хешрейт и аптайм")
+    return snap
+
+
+class WhatsminerWeb:
+    """Работа через веб-морду LuCI: вход как в браузере, чтение статуса, кнопка Reboot."""
+
+    api = "web"
+    STATUS_GUESSES = ("/admin/status/btminerstatus", "/admin/status/cgminerstatus", "/admin/status/minerstatus",
+                      "/admin/status/miner", "/admin/status/overview")
+
+    def __init__(self, url: str, user: str = "admin", password: str = "admin", timeout: float = 20.0):
+        u = url.strip().rstrip("/")
+        if "://" not in u:
+            u = "http://" + u
+        sp = urllib.parse.urlsplit(u)
+        self.origin = "%s://%s" % (sp.scheme, sp.netloc)
+        self.host = sp.hostname or ""
+        self.user, self.password, self.timeout = user, password, timeout
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # у асиков самоподписанный сертификат
+        try:
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+        except ssl.SSLError:
+            pass
+        self._jar = http.cookiejar.CookieJar()
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(self._jar),
+            urllib.request.HTTPSHandler(context=ctx))
+        self.prefix: Optional[str] = None  # .../cgi-bin/luci или .../cgi-bin/luci/;stok=...
+        self.menu: List[str] = []
+        self.status_urls: List[str] = []
+
+    # ---- HTTP ----
+    def _req(self, url: str, data: Optional[dict] = None, expect_drop: bool = False) -> Tuple[str, str]:
+        body = urllib.parse.urlencode(data).encode() if data is not None else None
+        req = urllib.request.Request(url, data=body, headers={"User-Agent": "Mozilla/5.0 wm_watchdog"})
+        try:
+            with self._opener.open(req, timeout=self.timeout) as r:
+                return r.geturl(), r.read(2_000_000).decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            e.close()
+            if e.code in (401, 403):
+                return url, ""
+            raise ApiError("веб: %s отдал HTTP %d" % (url.split("?")[0], e.code)) from e
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            if expect_drop:
+                return url, ""
+            reason = getattr(e, "reason", e)
+            raise Unreachable("%s — нет связи с веб-мордой (%s)" % (self.origin, reason)) from e
+
+    def _logged_out(self, html_text: str) -> bool:
+        return 'name="luci_password"' in html_text or "name='luci_password'" in html_text or \
+            ("Authorization Required" in html_text and "password" in html_text.lower())
+
+    def login(self) -> None:
+        self._jar.clear()
+        final, page = self._req(self.origin + "/cgi-bin/luci",
+                                {"luci_username": self.user, "luci_password": self.password})
+        if self._logged_out(page) or not page:
+            raise ApiError("веб: не пускает с логином %s — проверь пароль" % self.user)
+        m = re.search(r"^(.*?/cgi-bin/luci(?:/;stok=[0-9A-Za-z]+)?)", final)
+        self.prefix = m.group(1) if m else self.origin + "/cgi-bin/luci"
+        info = _PageInfo()
+        try:
+            info.feed(page)
+        except Exception:  # noqa: BLE001
+            pass
+        self.menu = [urllib.parse.urljoin(final, x) for x in info.links]
+
+    def _get(self, path_or_url: str) -> Tuple[str, str]:
+        if self.prefix is None:
+            self.login()
+        url = path_or_url if "://" in path_or_url else self.prefix + path_or_url  # type: ignore[operator]
+        final, page = self._req(url)
+        if self._logged_out(page) or (not page and "/admin" in url):
+            self.login()  # сессия истекла — входим заново
+            if "://" in path_or_url and ";stok=" in path_or_url:
+                path_or_url = re.sub(r"^.*?/cgi-bin/luci(?:/;stok=[0-9A-Za-z]+)?", "", path_or_url)
+            url = path_or_url if "://" in path_or_url else self.prefix + path_or_url  # type: ignore[operator]
+            final, page = self._req(url)
+        return final, page
+
+    # ---- статус ----
+    def _candidates(self) -> List[str]:
+        menu = [u for u in self.menu if "/admin/status/" in u and not _probe_is_dangerous(u)]
+        menu.sort(key=lambda u: -(("miner" in u.lower()) * 2 + ("status" in u.lower())))
+        stripped = [re.sub(r"^.*?/cgi-bin/luci(?:/;stok=[0-9A-Za-z]+)?", "", u) for u in menu]
+        return list(dict.fromkeys(stripped + list(self.STATUS_GUESSES)))
+
+    def _read(self, path: str, kv: Dict[str, str], rows: List[Dict[str, str]]) -> List[str]:
+        final, page = self._get(path)
+        text = page.lstrip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                _json_to_data(json.loads(text), kv, rows)
+            except ValueError:
+                pass
+            return []
+        tp = _TableParser()
+        try:
+            tp.feed(page)
+        except Exception:  # noqa: BLE001
+            return []
+        _tables_to_data(tp.tables, kv, rows)
+        # адреса автообновления (XHR) — там часто свежие цифры в JSON
+        polls = re.findall(r"""["']((?:https?://[^"'\s]+)?/cgi-bin/luci[^"'\s]*status[^"'\s]*)["']""", page)
+        return [urllib.parse.urljoin(final, x) for x in polls if not _probe_is_dangerous(x)]
+
+    def snapshot(self) -> Snapshot:
+        paths = self.status_urls or self._candidates()
+        last: Optional[Exception] = None
+        for path in paths:
+            kv: Dict[str, str] = {}
+            rows: List[Dict[str, str]] = []
+            try:
+                polls = self._read(path, kv, rows)
+                for pu in polls[:3]:
+                    self._read(pu, kv, rows)
+                snap = _snapshot_from_data(kv, rows)
+            except NoData as e:
+                last = e
+                continue
+            except ApiError as e:
+                if isinstance(e, Unreachable):
+                    raise
+                last = e
+                continue
+            self.status_urls = [path]
+            return snap
+        self.status_urls = []
+        raise NoData("веб: не нашёл страницу с хешрейтом (%s). Запусти web-probe и пришли файл" % last)
+
+    # ---- действия ----
+    def _reboot_page(self) -> Tuple[str, str]:
+        final, page = self._get("/admin/system/reboot")
+        if page:
+            return final, page
+        for u in self.menu:
+            if "reboot" in u.lower() and "call" not in u.lower() and "reboot=" not in u.lower():
+                return self._get(u)
+        raise ApiError("веб: не нашёл страницу перезагрузки (System → Reboot)")
+
+    def reboot(self) -> dict:
+        final, page = self._reboot_page()
+        call = re.search(r"""["']([^"']*/admin/system/reboot/call)["']""", page)
+        token = re.search(r"""token["']?\s*[:=]\s*["']([0-9A-Za-z]+)["']""", page) or \
+            re.search(r"""name=["']token["'][^>]*value=["']([0-9A-Za-z]+)["']""", page)
+        if call or token:  # LuCI 15.05+: POST .../reboot/call с CSRF-токеном
+            url = urllib.parse.urljoin(final, call.group(1)) if call else final.split("?")[0] + "/call"
+            self._req(url, {"token": token.group(1) if token else ""}, expect_drop=True)
+        else:  # старый LuCI: GET .../reboot?reboot=1
+            self._req(final.split("?")[0] + "?reboot=1", expect_drop=True)
+        return {"Msg": "перезагрузка отправлена через веб-морду"}
+
+    def restart(self) -> dict:
+        raise ApiError("перезапуск только майнера через веб-морду не поддерживается — используй reboot")
+
+    def check_auth(self) -> dict:
+        self.login()
+        self._reboot_page()  # только открываем страницу, ничего не нажимаем
+        return {"Msg": "вход в веб-морду есть, страница перезагрузки найдена"}
+
+    def power_limit(self, watts: int) -> dict:
+        raise ApiError("лимит мощности через веб-морду не поддерживается")
+
+    def power_mode(self, mode: str) -> dict:
+        raise ApiError("режим мощности через веб-морду не поддерживается")
+
+
+# =============================================================================
 #  Конфиг
 # =============================================================================
 
@@ -857,6 +1192,9 @@ class MinerConf:
     check_dead_boards: bool = True
     min_fan_rpm: float = 600.0
     fault_codes: List[int] = field(default_factory=list)
+    web_url: str = ""
+    web_user: str = "admin"
+    web_password: Optional[str] = None
     actions: List[str] = field(default_factory=lambda: ["reboot"])
     enabled: bool = True
 
@@ -888,7 +1226,8 @@ class Settings:
 
 VALID_ACTIONS = ("restart", "reboot", "hook")
 MINER_KEYS = ("host", "api", "password", "password_v3", "port", "port_v3", "expected_ths",
-              "min_hashrate_pct", "check_dead_boards", "min_fan_rpm", "fault_codes", "actions", "enabled")
+              "min_hashrate_pct", "check_dead_boards", "min_fan_rpm", "fault_codes", "actions", "enabled",
+              "web_url", "web_user", "web_password")
 
 
 class ConfigError(Exception):
@@ -918,9 +1257,15 @@ def _apply_miner_opts(mc: MinerConf, sect: configparser.SectionProxy, where: str
         v = sect[key].strip()
         k = "[%s] %s" % (where, key)
         if key == "api":
-            if v not in ("auto", "v2", "v3"):
-                raise ConfigError("%s: допустимо auto, v2 или v3" % k)
+            if v not in ("auto", "v2", "v3", "web"):
+                raise ConfigError("%s: допустимо auto, v2, v3 или web" % k)
             mc.api = v
+        elif key == "web_url":
+            _set_web(mc, v)
+        elif key == "web_user":
+            mc.web_user = v
+        elif key == "web_password":
+            mc.web_password = sect[key]
         elif key in ("password", "password_v3"):
             setattr(mc, key, sect[key])  # пароль берём как есть, без strip
         elif key in ("port", "port_v3"):
@@ -939,6 +1284,13 @@ def _apply_miner_opts(mc: MinerConf, sect: configparser.SectionProxy, where: str
             if bad or not acts:
                 raise ConfigError("%s: допустимые действия: %s" % (k, ", ".join(VALID_ACTIONS)))
             mc.actions = acts
+
+
+def _set_web(mc: MinerConf, url: str) -> None:
+    """Асик, указанный адресом веб-морды (как в браузере): работаем через веб."""
+    mc.web_url = url
+    mc.host = urllib.parse.urlsplit(url).hostname or mc.host
+    mc.api = "web"
 
 
 def load_config(path: str) -> Tuple[Settings, List[MinerConf]]:
@@ -992,7 +1344,12 @@ def load_config(path: str) -> Tuple[Settings, List[MinerConf]]:
             host = host.strip()
             if not host:
                 raise ConfigError("[miners] %s: не указан IP" % name)
-            miners[name] = new_miner(name, host)
+            if host.lower().startswith(("http://", "https://")):
+                mc = new_miner(name, host)
+                _set_web(mc, host)
+                miners[name] = mc
+            else:
+                miners[name] = new_miner(name, host)
     for sect in cp.sections():
         if not sect.startswith("miner:"):
             continue
@@ -1133,6 +1490,7 @@ class MinerWatch:
     incident_errors: set = field(default_factory=set)
     last_snapshot: Optional[Snapshot] = None
     warned_no_hashrate: bool = False
+    warned_no_data: bool = False
     prev_sig: Tuple = ()
     prev_uptime: Optional[int] = None
     prev_time: Optional[float] = None
@@ -1204,8 +1562,15 @@ class Watchdog:
         except (Unreachable, NoReply) as e:
             self._on_unreachable(w, now, e)
             return
+        except NoData as e:
+            if not w.warned_no_data:
+                w.warned_no_data = True
+                log.warning("%s: %s — следить за ним пока не получается", w.conf.name, e)
+                self.notifier.send("⚠️ %s: %s" % (w.conf.name, e))
+            return
         except ApiError as e:
             snap = Snapshot(read_error=str(e))
+        w.warned_no_data = False
         self._on_reachable(w, now, snap)
 
     def evaluate(self, w: MinerWatch, snap: Snapshot, now: float) -> Tuple[str, List[str]]:
@@ -1418,7 +1783,8 @@ class Watchdog:
 
 def make_client(m: MinerConf, s: Settings) -> MinerClient:
     return MinerClient(m.host, api=m.api, password=m.password, password_v3=m.password_v3,
-                       port=m.port, port_v3=m.port_v3, timeout=s.timeout)
+                       port=m.port, port_v3=m.port_v3, timeout=s.timeout, web_url=m.web_url,
+                       web_user=m.web_user, web_password=m.web_password)
 
 
 # =============================================================================
@@ -1517,13 +1883,17 @@ def _select(miners: List[MinerConf], target: str) -> List[MinerConf]:
     found = [m for m in miners if target in (m.name, m.host)]
     if found:
         return found
-    # асика нет в конфиге — работаем по IP с настройками по умолчанию
+    # асика нет в конфиге — работаем по IP или адресу веб-морды с настройками по умолчанию
+    base = miners[0] if miners else MinerConf(name=target, host=target)
+    mc = MinerConf(name=target, host=target, api="auto", password=base.password, password_v3=base.password_v3)
+    if target.lower().startswith(("http://", "https://")):
+        _set_web(mc, target)
+        return [mc]
     try:
         ipaddress.ip_address(target)
     except ValueError:
         raise ConfigError("асик %r не найден в конфиге" % target)
-    base = miners[0] if miners else MinerConf(name=target, host=target)
-    return [MinerConf(name=target, host=target, api="auto", password=base.password, password_v3=base.password_v3)]
+    return [mc]
 
 
 def cmd_status(st: Settings, miners: List[MinerConf]) -> int:

@@ -913,6 +913,229 @@ class WebProbeTests(unittest.TestCase):
             self.assertNotIn(secret, report)
 
 
+class FakeWebMiner:
+    """Веб-морда Whatsminer на старом LuCI: вход → ;stok=, таблицы статуса, System → Reboot."""
+
+    STOK = "0123456789abcdef0123456789abcdef"
+    SID = "f00dfeedf00dfeedf00dfeedf00dfeed"
+    TOKEN = "c0ffee00c0ffee00c0ffee00c0ffee00"
+
+    def __init__(self, password="test-pass", reboot_style="old", with_data=True):
+        import http.server
+        fake = self
+        self.password, self.reboot_style, self.with_data = password, reboot_style, with_data
+        self.requests, self.reboots, self.logins = [], 0, 0
+        self.session_valid = False
+        self.uptime, self.hashrate, self.fans, self.frozen, self.polls = 15134, 104.1, (4500, 4400), False, 0
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, body="", headers=None, ctype="text/html"):
+                data = body.encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def login_page(self):
+                return self._send(200, "<html><body><h2>Authorization Required</h2><form method='post' "
+                                  "action='/cgi-bin/luci'><input name='luci_username' value='admin'>"
+                                  "<input type='password' name='luci_password'><input type='submit' "
+                                  "value='Login'></form></body></html>")
+
+            def ok_session(self):
+                return fake.session_valid and ("sysauth=" + fake.SID) in (self.headers.get("Cookie") or "") \
+                    and (";stok=%s/" % fake.STOK) in self.path + "/"
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+                fake.requests.append(("POST", self.path, body))
+                if self.path == "/cgi-bin/luci":
+                    if ("luci_password=" + fake.password) in body:
+                        fake.logins += 1
+                        fake.session_valid = True
+                        return self._send(302, headers={
+                            "Location": "/cgi-bin/luci/;stok=%s" % fake.STOK,
+                            "Set-Cookie": "sysauth=%s; path=/cgi-bin/luci/;stok=%s" % (fake.SID, fake.STOK)})
+                    return self.login_page()
+                if self.path.endswith("/admin/system/reboot/call") and self.ok_session() \
+                        and ("token=" + fake.TOKEN) in body and fake.reboot_style == "new":
+                    fake.reboots += 1
+                    return self._send(200, "{}", ctype="application/json")
+                return self._send(403, "forbidden")
+
+            def do_GET(self):
+                fake.requests.append(("GET", self.path, ""))
+                if not self.ok_session():
+                    return self.login_page()
+                pre = "/cgi-bin/luci/;stok=%s" % fake.STOK
+                path = self.path
+                if path in (pre, pre + "/"):
+                    return self._send(302, headers={"Location": pre + "/admin/status/overview"})
+                if path == pre + "/admin/status/overview":
+                    return self._send(200, "<html><title>Overview</title><ul class='nav'>"
+                                      "<li><a href='%s/admin/status/overview'>Overview</a></li>"
+                                      "<li><a href='%s/admin/status/btminerstatus'>Miner Status</a></li>"
+                                      "<li><a href='%s/admin/system/reboot'>Reboot</a></li>"
+                                      "<li><a href='%s/admin/logout'>Logout</a></li></ul>"
+                                      "<table><tr><td>Model</td><td>WhatsMiner M30S++_VH95</td></tr></table>"
+                                      "</html>" % (pre, pre, pre, pre))
+                if path == pre + "/admin/status/btminerstatus":
+                    if not fake.with_data:
+                        return self._send(200, "<html><title>Miner Status</title><p>loading…</p></html>")
+                    if not fake.frozen:
+                        fake.polls += 1
+                        fake.uptime += 60
+                    jit = (fake.polls % 7) * 1000 if fake.hashrate else 0
+                    mhs = fake.hashrate * 1e6 + jit
+                    up = fake.uptime
+                    el = "%dd %dh %dm %ds" % (up // 86400, up % 86400 // 3600, up % 3600 // 60, up % 60)
+                    b = mhs / 3
+                    return self._send(200, (
+                        "<html><title>Miner Status</title><h3>Summary</h3><table class='cbi-section-table'>"
+                        "<tr><th>Elapsed</th><th>MHS av</th><th>MHS 5s</th><th>MHS 1m</th><th>Fan Speed In</th>"
+                        "<th>Fan Speed Out</th><th>Power</th><th>Factory GHS</th></tr>"
+                        "<tr><td>%s</td><td>%.2f</td><td>%.2f</td><td>%.2f</td><td>%d</td><td>%d</td><td>3412</td>"
+                        "<td>104000</td></tr></table><h3>Devices</h3><table>"
+                        "<tr><th>Slot</th><th>Temperature</th><th>MHS av</th><th>MHS 1m</th></tr>"
+                        "<tr><td>0</td><td>67.1</td><td>%.2f</td><td>%.2f</td></tr>"
+                        "<tr><td>1</td><td>58.2</td><td>%.2f</td><td>%.2f</td></tr>"
+                        "<tr><td>2</td><td>65.4</td><td>%.2f</td><td>%.2f</td></tr></table>"
+                        "<h3>Pools</h3><table><tr><th>URL</th><th>Status</th><th>Accepted</th></tr>"
+                        "<tr><td>stratum+tcp://pool.example:3333</td><td>Alive</td><td>1234</td></tr></table>"
+                        "</html>") % (el, mhs, mhs, mhs, fake.fans[0], fake.fans[1], b, b, b, b, b, b))
+                if path == pre + "/admin/system/reboot":
+                    if fake.reboot_style == "new":
+                        return self._send(200, "<html><title>Reboot</title><input type='button' "
+                                          "value='Perform reboot' onclick='reboot()'><script>function reboot(){"
+                                          "XHR.post('%s/admin/system/reboot/call', { token: '%s' });}</script>"
+                                          "</html>" % (pre, fake.TOKEN))
+                    return self._send(200, "<html><title>Reboot</title><p><a href='%s/admin/system/reboot"
+                                      "?reboot=1'>Perform reboot</a></p></html>" % pre)
+                if path == pre + "/admin/system/reboot?reboot=1" and fake.reboot_style == "old":
+                    fake.reboots += 1
+                    fake.uptime = 30
+                    return self._send(200, "<html>Rebooting…</html>")
+                return self._send(404, "not found")
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class WebClientTests(unittest.TestCase):
+    def make(self, **kw):
+        self.fake = FakeWebMiner(**kw)
+        self.addCleanup(self.fake.close)
+        return wm.WhatsminerWeb(self.fake.url + "/cgi-bin/luci", "admin", "test-pass", timeout=5)
+
+    def test_snapshot_from_status_tables(self):
+        c = self.make()
+        snap = c.snapshot()
+        self.assertEqual(snap.api, "web")
+        self.assertAlmostEqual(snap.hashrate_ths, 104.1, places=1)
+        self.assertAlmostEqual(snap.expected_ths, 104.0)
+        self.assertEqual(snap.uptime_s, 15194)
+        self.assertEqual((snap.fan_in, snap.fan_out), (4500, 4400))
+        self.assertEqual(len(snap.boards_ths), 3)
+        self.assertTrue(snap.hr_sig)
+        self.assertEqual(self.fake.reboots, 0)
+
+    def test_reboot_old_luci(self):
+        c = self.make(reboot_style="old")
+        c.snapshot()
+        c.reboot()
+        self.assertEqual(self.fake.reboots, 1)
+
+    def test_reboot_new_luci_with_token(self):
+        c = self.make(reboot_style="new")
+        c.reboot()
+        self.assertEqual(self.fake.reboots, 1)
+
+    def test_check_auth_does_not_reboot(self):
+        c = self.make()
+        self.assertIn("найдена", c.check_auth()["Msg"])
+        self.assertEqual(self.fake.reboots, 0)
+        self.assertFalse(any("reboot=1" in p for _, p, _ in self.fake.requests))
+
+    def test_wrong_password(self):
+        self.fake = FakeWebMiner(password="other")
+        self.addCleanup(self.fake.close)
+        c = wm.WhatsminerWeb(self.fake.url, "admin", "test-pass", timeout=5)
+        with self.assertRaises(wm.ApiError) as cm:
+            c.snapshot()
+        self.assertIn("пароль", str(cm.exception))
+
+    def test_session_expiry_relogin(self):
+        c = self.make()
+        c.snapshot()
+        self.fake.session_valid = False  # сессия протухла
+        c.snapshot()
+        self.assertEqual(self.fake.logins, 2)
+
+    def test_no_data_is_nodata(self):
+        c = self.make(with_data=False)
+        with self.assertRaises(wm.NoData):
+            c.snapshot()
+
+    def test_unreachable(self):
+        c = wm.WhatsminerWeb("http://127.0.0.1:%d" % closed_port(), "admin", "x", timeout=3)
+        with self.assertRaises(wm.Unreachable):
+            c.snapshot()
+
+    def test_duration_parsing(self):
+        self.assertEqual(wm._parse_duration("4h 12m 14s"), 15134)
+        self.assertEqual(wm._parse_duration("1d 0h 0m 5s"), 86405)
+        self.assertEqual(wm._parse_duration("04:12:14"), 15134)
+        self.assertEqual(wm._parse_duration("15134"), 15134)
+        self.assertIsNone(wm._parse_duration("n/a"))
+
+
+class WebWatchdogTests(unittest.TestCase):
+    def run_wd(self, fake, ticks, miner_kw=None):
+        st = wm.Settings(bad_checks=3, timeout=5)
+        miner = wm.MinerConf(name="m1", host="127.0.0.1", password="test-pass", **(miner_kw or {}))
+        wm._set_web(miner, fake.url)
+        clock = FakeClock()
+        notes = CollectNotifier()
+        wd = wm.Watchdog(st, [miner], notes, wm.EventLog(""), clock=clock)
+        for step in ticks:
+            step(fake)
+            wd.check_all()
+            clock.t += 60
+        return notes
+
+    def test_frozen_miner_rebooted_via_web(self):
+        fake = FakeWebMiner()
+        self.addCleanup(fake.close)
+
+        def healthy(f):
+            pass
+
+        def frozen(f):  # ошибка по БП: цифры застыли, вентиляторы еле крутятся
+            f.frozen, f.fans = True, (250, 300)
+
+        notes = self.run_wd(fake, [healthy] * 3 + [frozen] * 3)
+        self.assertEqual(fake.reboots, 1)
+        self.assertIn("майнер завис", notes.msgs[-1])
+
+    def test_unparseable_page_never_reboots(self):
+        fake = FakeWebMiner(with_data=False)
+        self.addCleanup(fake.close)
+        notes = self.run_wd(fake, [lambda f: None] * 15)
+        self.assertEqual(fake.reboots, 0)
+        self.assertEqual(len([m for m in notes.msgs if "⚠️" in m]), 1)
+
+
 class ConfigTests(unittest.TestCase):
     def test_load(self):
         ini = """
@@ -930,6 +1153,7 @@ daily_report_hour = 9
 [miners]
 asic-01 = 192.168.1.101
 asic-02 = 192.168.1.102
+tochka1 = https://203.0.113.5:1002
 
 [miner:asic-02]
 password = p#ss;word
@@ -953,7 +1177,11 @@ api = v3
         self.assertEqual(st.daily_report_hour, 9)
         self.assertTrue(st.events_file.endswith("wm_events.csv"))
         by = {m.name: m for m in miners}
-        self.assertEqual(set(by), {"asic-01", "asic-02", "asic-03"})
+        self.assertEqual(set(by), {"asic-01", "asic-02", "asic-03", "tochka1"})
+        self.assertEqual(by["tochka1"].api, "web")
+        self.assertEqual(by["tochka1"].web_url, "https://203.0.113.5:1002")
+        self.assertEqual(by["tochka1"].host, "203.0.113.5")
+        self.assertEqual(by["tochka1"].password, "pw1")
         self.assertEqual(by["asic-01"].password, "pw1")
         self.assertEqual(by["asic-01"].actions, ["restart", "reboot"])
         self.assertEqual(by["asic-02"].password, "p#ss;word")
