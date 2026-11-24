@@ -1,0 +1,15 @@
+# Netlify может хостить ТОЛЬКО статический фронт мини-аппа.
+# Бот, API и планировщик должны работать на сервере (см. README → Деплой).
+# Для такой схемы задайте в Netlify переменную VITE_API_BASE=https://api.ваш-домен,
+# а на сервере — WEBAPP_ORIGIN=https://ваш-сайт.netlify.app и PUBLIC_URL=https://ваш-сайт.netlify.app
+[build]
+  command = "npm run build -w webapp"
+  publish = "webapp/dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

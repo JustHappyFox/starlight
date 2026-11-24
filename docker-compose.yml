@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: server/.env
+    environment:
+      DATABASE_PATH: /app/data/starlight.db
+      WEBAPP_DIST: /app/webapp/dist
+    volumes:
+      - ./data:/app/data
+    ports:
+      - '127.0.0.1:3000:3000'

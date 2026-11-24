@@ -1,58 +1,117 @@
-# Starlight Starter Kit: Basics
+# Starlight Giveaways — розыгрыши Stars и Premium в Telegram
 
-[![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
+Бот + мини-апп для розыгрышей в Telegram-каналах. Организатор платит в TON за призы
+(Telegram Stars или Premium) **по цене Telegram**, бот хранит деньги (по желанию — в USDT),
+в конце честно выбирает победителей и **сам отправляет призы через Fragment** — дешевле, чем
+в приложении. Разница — маржа сервиса.
+
+> Перед доработкой прочитайте [JOURNAL.md](JOURNAL.md) — журнал решений и грабель.
+
+## Как это работает
+
+**Организатор** (в мини-аппе):
+1. Подключает канал — добавляет бота администратором (кнопка «Подключить канал»).
+2. Настраивает: приз (Stars: 50…100 000 на человека / Premium 3·6·12 мес.), число победителей,
+   даты начала и итогов, страны, капчу, кнопку-ловушку, обязательную подписку, текст поста,
+   текст кнопки (свой или из готовых), «опубликовать результаты после розыгрыша».
+3. Оплачивает в TON через TON Connect (или ссылкой `ton://`). После оплаты условия фиксируются.
+4. Бот публикует пост с кнопкой в канале (сразу или в назначенное время).
+
+**Участник:**
+1. Жмёт кнопку под постом → открывается мини-апп.
+2. Если включена капча — вводит символы с картинки; если ограничены страны — один раз подтверждает
+   номер телефона (страна определяется по номеру, сам номер не хранится).
+3. Участвует → получает билет. Нижняя кнопка становится **«Увеличить шанс»**: число участников,
+   сколько он пригласил, реф-ссылка. Каждый приглашённый, который сам принял участие, — +1 билет.
+4. После итогов кнопка под постом становится **«🏆 Результаты»** — список победителей и протокол проверки.
+
+**Бот в конце:** перепроверяет победителей (подписка, баны), публикует итоги в канал (если отмечено),
+пишет победителям и отправляет призы через Fragment на их @username.
+
+## Защита
+
+| От кого | Как |
+| --- | --- |
+| Ботов-фармеров | Подпись Telegram initData на каждом запросе; капча-картинка (одноразовая, TTL, минимальное время решения); невидимая кнопка-ловушка + скрытое поле + эндпоинт-приманка; лимиты запросов; повторные срабатывания → глобальный бан |
+| Нечестного розыгрыша | Commit–reveal: хеш секрета в посте до старта, раскрытие после; энтропия из блока TON; протокол JSON и скрипт проверки |
+| Организатора | Призы оплачены заранее; условия после оплаты не меняются; невыданные призы → возврат |
+| Утечки данных | В протоколе — псевдонимы, телефон не хранится (только страна) |
+
+Ловушка: бот, нажавший невидимую кнопку, получает «успех», но доступ закрывается; при нажатии настоящей
+кнопки он видит «🚫 Доступ к розыгрышу заблокирован». Настоящая кнопка в Telegram — нативная (её нет в DOM).
+
+Ограничение Telegram: кнопка под постом одна для всех, сделать её невидимой или персональной нельзя —
+поэтому ловушки и «Увеличить шанс» живут внутри мини-аппа.
+
+## Структура
 
 ```
-npm create astro@latest -- --template starlight
+server/   Node.js + TypeScript: grammY (бот), Fastify (API + раздача мини-аппа), SQLite, планировщик
+webapp/   Мини-апп: Preact + Vite, TON Connect UI (грузится только на экране оплаты)
+shared/   Общие типы API и алгоритм честного розыгрыша
 ```
 
-<!-- ASTRO:REMOVE:START -->
+## Запуск для разработки
 
-[![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/withastro/starlight/tree/main/examples/basics)
-[![Open with CodeSandbox](https://assets.codesandbox.io/github/button-edit-lime.svg)](https://codesandbox.io/p/sandbox/github/withastro/starlight/tree/main/examples/basics)
-[![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/withastro/starlight&create_from_path=examples/basics)
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fwithastro%2Fstarlight%2Ftree%2Fmain%2Fexamples%2Fbasics&project-name=my-starlight-docs&repository-name=my-starlight-docs)
-
-<!-- ASTRO:REMOVE:END -->
-
-> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
-
-## 🚀 Project Structure
-
-Inside of your Astro + Starlight project, you'll see the following folders and files:
-
-```
-.
-├── public/
-├── src/
-│   ├── assets/
-│   ├── content/
-│   │   └── docs/
-│   └── content.config.ts
-├── astro.config.mjs
-├── package.json
-└── tsconfig.json
+```bash
+npm install
+cp .env.example server/.env        # заполните BOT_TOKEN, для dev: DEV_MODE=true, BOT_MODE=polling
+npm run build -w webapp            # или npm run dev:webapp (Vite на :5173 с прокси на :3000)
+npm run dev:server
+npm test                           # 33 теста: initData, розыгрыш, цены, капча, Fragment, полный сценарий
 ```
 
-Starlight looks for `.md` or `.mdx` files in the `src/content/docs/` directory. Each file is exposed as a route based on its file name.
+С `DEV_MODE=true` мини-апп открывается в обычном браузере: `http://localhost:3000/?uid=1001&username=me`
+(подпись initData выдаёт `/api/dev/initdata`), оплата симулируется `POST /api/dev/pay/<invoiceId>`.
+**В продакшене DEV_MODE запрещён** (сервер не стартует).
 
-Images can be added to `src/assets/` and embedded in Markdown with a relative link.
+## Настройка в BotFather
 
-Static assets, like favicons, can be placed in the `public/` directory.
+1. `/newbot` → `BOT_TOKEN`.
+2. Мини-апп: `/newapp` (короткое имя → `MINIAPP_SHORT_NAME`) **или** Bot Settings → Configure Mini App
+   (Main Mini App). URL — ваш `PUBLIC_URL` (HTTPS).
+3. Бот сам выставит кнопку меню и webhook при старте.
 
-## 🧞 Commands
+## Fragment и кошелёк
 
-All commands are run from the root of the project, from a terminal:
+1. Создайте **отдельный** TON-кошелёк под бота (24 слова → `TON_WALLET_MNEMONIC`). На него приходит оплата,
+   с него оплачиваются призы. Держите на нём резерв TON под газ (`TREASURY_GAS_RESERVE_TON`).
+2. Импортируйте этот кошелёк в Tonkeeper, войдите на fragment.com через Telegram и подключите этот кошелёк.
+3. Скопируйте cookie fragment.com (`stel_ssid`, `stel_token`, `stel_ton_token`, …) в `FRAGMENT_COOKIES`.
+4. Проверьте в `FULFILLMENT_DRY_RUN=true` (переводы не уходят, в логах видны суммы), затем включите боевой режим.
 
-| Command                   | Action                                           |
-| :------------------------ | :----------------------------------------------- |
-| `npm install`             | Installs dependencies                            |
-| `npm run dev`             | Starts local dev server at `localhost:4321`      |
-| `npm run build`           | Build your production site to `./dist/`          |
-| `npm run preview`         | Preview your build locally, before deploying     |
-| `npm run astro ...`       | Run CLI commands like `astro add`, `astro check` |
-| `npm run astro -- --help` | Get help using the Astro CLI                     |
+⚠️ У Fragment **нет официального API** — используется внутренний API сайта. Он может измениться;
+сессия cookie может истечь (бот сообщит админам). Получатель ищется только по @username, поэтому
+username обязателен для участия.
 
-## 👀 Want to learn more?
+## Деньги
 
-Check out [Starlight’s docs](https://starlight.astro.build/), read [the Astro documentation](https://docs.astro.build), or jump into the [Astro Discord server](https://astro.build/chat).
+- Цена: прайс Telegram (`TG_STAR_PRICE_USD`, `TG_PREMIUM_PRICES_USD`) × число призов → TON по курсу
+  (tonapi / CoinGecko) + `RATE_BUFFER`.
+- `TREASURY_MODE=usdt`: поступившие TON сразу меняются в USDT на STON.fi (защита от падения курса), перед
+  выдачей приза нужный TON докупается обратно. `TREASURY_DRY_RUN=true` по умолчанию.
+- `/stats` в боте — выручка, оценка себестоимости, состояние выдачи.
+
+## Деплой (Docker)
+
+```bash
+cp .env.example server/.env   # заполнить
+docker compose up -d --build  # сервер слушает 127.0.0.1:3000 — поставьте перед ним HTTPS (Caddy/nginx)
+```
+
+База — `./data/starlight.db` (SQLite). Netlify (`netlify.toml`) может отдавать только статический фронт;
+бот и API всё равно нужно держать на сервере.
+
+## Проверка честности розыгрыша
+
+На экране результатов — «Протокол розыгрыша (JSON)». Проверка:
+
+```bash
+npm run verify -w server -- proof.json [ваш_telegram_id]
+# в контейнере: node dist/verify-draw.js proof.json
+```
+
+## Команды админа (`ADMIN_IDS`)
+
+`/stats` · `/failed` — проблемные выдачи · `/retry <gid> [uid] [force]` · `/refunds` ·
+`/markpaid <gid>` — подтвердить позднюю оплату · `/unban <user_id>`
