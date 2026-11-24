@@ -12,7 +12,25 @@ export type GiveawayStatus =
   | 'finished' // итоги подведены
   | 'cancelled'; // черновик отменён
 
-export type WinnerPrizeStatus = 'pending' | 'processing' | 'sent' | 'needs_username' | 'failed';
+export type WinnerPrizeStatus =
+  | 'pending'
+  | 'processing'
+  | 'sent'
+  | 'needs_username' // ждём действия победителя: поставить ник или указать другой аккаунт (см. issue)
+  | 'unclaimed' // не забран в срок — приз доразыгран
+  | 'failed';
+
+export type WinnerIssue = 'no_username' | 'not_found' | 'ineligible';
+
+/** Приз текущего пользователя (если он победитель) */
+export interface MyPrizeView {
+  status: WinnerPrizeStatus;
+  issue: WinnerIssue | null;
+  /** До какого момента нужно указать получателя */
+  deadline: number;
+  /** Кому отправлен/будет отправлен приз */
+  recipient: string | null;
+}
 
 export interface PriceQuote {
   prizeType: PrizeType;
@@ -119,6 +137,7 @@ export interface PublicGiveawayView {
     phoneCountry: string | null;
     countryOk: boolean;
     isWinner: boolean;
+    prize: MyPrizeView | null;
   };
   results: {
     drawnAt: number;

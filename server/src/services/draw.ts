@@ -143,3 +143,77 @@ async function afterDraw(ctx: AppContext, g: GiveawayRow) {
   );
   if (unused > 0) await notifyAdmins(ctx, `💸 Возврат: розыгрыш ${g.id}, не разыграно ${unused} приз(ов). /refunds`);
 }
+
+/**
+ * Доразыгрыш призов, не забранных в срок (статус winners = 'unclaimed').
+ *
+ * Честность сохраняется: розыгрыш повторяется по ТОМУ ЖЕ протоколу (seed, энтропия, замороженный
+ * список участников) — порядок выбора билетов не меняется, просто не забравшие приз помечаются
+ * disqualified/unclaimed, и поток продолжается до нужного числа победителей. verifyProof
+ * воспроизводит обновлённый протокол без изменений.
+ */
+export async function redrawGiveaway(ctx: AppContext, gid: string): Promise<number> {
+  const g = ctx.repo.getGiveaway(gid);
+  if (!g || g.status !== 'finished' || !g.proof) return 0;
+  const proof = JSON.parse(g.proof) as DrawProof;
+  const winners = ctx.repo.listWinners(gid);
+  const byP = new Map<string, number>();
+  for (const uid of ctx.repo.participantIds(gid)) byP.set(pseudonym(sha256Hex, gid, uid), uid);
+  const unclaimed = new Set(winners.filter((w) => w.status === 'unclaimed').map((w) => pseudonym(sha256Hex, gid, w.user_id)));
+  const recorded = new Map(proof.steps.map((s) => [s.p, s]));
+  const channelId = g.channel_id;
+
+  const result = await runDraw({
+    sha: sha256Hex,
+    seed: proof.seed,
+    entropy: proof.entropy.value,
+    entries: proof.entries,
+    winnersCount: g.winners_count,
+    decide: async (p) => {
+      if (unclaimed.has(p)) return { ok: false, reason: 'unclaimed' };
+      const rec = recorded.get(p);
+      if (rec) return { ok: rec.result === 'win', reason: rec.reason };
+      const uid = byP.get(p);
+      if (uid === undefined) return { ok: false, reason: 'unknown' };
+      const u = ctx.repo.getUser(uid);
+      if (!u || u.global_ban || ctx.repo.getBan(gid, uid)) return { ok: false, reason: 'banned' };
+      if (g.require_subscription && channelId !== null && !(await isSubscribed(ctx, channelId, uid))) return { ok: false, reason: 'not_subscribed' };
+      return { ok: true };
+    },
+  });
+
+  const known = new Set(winners.map((w) => w.user_id));
+  const fresh = result.winners.map((p) => byP.get(p)!).filter((uid) => !known.has(uid));
+  const taken = new Set(winners.filter((w) => w.status !== 'unclaimed').map((w) => w.place));
+  const free = Array.from({ length: g.winners_count }, (_, i) => i + 1).filter((pl) => !taken.has(pl));
+
+  const now = ctx.now();
+  ctx.repo.tx(() => {
+    fresh.forEach((uid, i) => ctx.repo.insertWinner({ giveaway_id: gid, user_id: uid, place: free[i] ?? g.winners_count, status: 'pending' }, now));
+    ctx.repo.updateGiveaway(gid, { proof: JSON.stringify({ ...proof, steps: result.steps }) }, now);
+    const missing = free.length - fresh.length;
+    if (missing > 0) {
+      ctx.repo.insertRefund({ giveaway_id: gid, reason: `не забрано и некому передать: ${missing}`, usd_cents: missing * unitPriceCents(ctx.cfg, g.prize_type, g.prize_amount) }, now);
+    }
+  });
+  ctx.log.info({ gid, fresh: fresh.length, free: free.length }, 'giveaway redrawn');
+
+  const prize = escapeHtml(prizeLabel(g.prize_type, g.prize_amount));
+  for (const uid of fresh) {
+    await dm(ctx, uid, `🎉 <b>Вы выиграли!</b> (доразыгрыш: прошлый победитель не забрал приз)\n\nПриз: ${prize}. Он будет отправлен на ваш @username автоматически.`);
+  }
+  if (g.publish_results && channelId !== null && fresh.length) {
+    const names = fresh.map((uid) => {
+      const u = ctx.repo.getUser(uid);
+      return u?.username ? `@${escapeHtml(u.username)}` : escapeHtml(u?.first_name || 'Участник');
+    });
+    await ctx.tg
+      .sendMessage(channelId, `🔄 <b>Доразыгрыш</b>: приз не был получен вовремя.\nНовый победитель: ${names.join(', ')}`, {
+        parse_mode: 'HTML',
+        ...(g.post_message_id ? { reply_parameters: { message_id: g.post_message_id, allow_sending_without_reply: true } } : {}),
+      })
+      .catch((e) => ctx.log.warn({ gid, err: String(e) }, 'redraw post failed'));
+  }
+  if (free.length > fresh.length) await notifyAdmins(ctx, `💸 Возврат: ${gid}, не забрано и некому передать ${free.length - fresh.length}. /refunds`);
+  return fresh.length;
+}

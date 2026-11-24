@@ -1,5 +1,18 @@
-import { Address, beginCell, Cell, internal, SendMode, storeStateInit, TonClient, WalletContractV4, WalletContractV5R1 } from '@ton/ton';
-import { mnemonicToPrivateKey } from '@ton/crypto';
+import {
+  Address,
+  beginCell,
+  Cell,
+  external,
+  internal,
+  SendMode,
+  storeMessage,
+  storeStateInit,
+  TonClient,
+  WalletContractV4,
+  WalletContractV5R1,
+} from '@ton/ton';
+import { mnemonicToPrivateKey, sign } from '@ton/crypto';
+import { createHash } from 'node:crypto';
 import type { Logger } from '../util/logger.js';
 
 export interface OutMessage {
@@ -9,11 +22,52 @@ export interface OutMessage {
   bounce?: boolean;
 }
 
+export interface TonConnectAccount {
+  address: string;
+  chain: string;
+  walletStateInit: string;
+  publicKey: string;
+}
+
+export interface TonProof {
+  timestamp: number;
+  domain: { lengthBytes: number; value: string };
+  payload: string;
+  signature: string;
+}
+
 export interface WalletLike {
   readonly address: string;
   balance(): Promise<bigint>;
-  send(messages: OutMessage[], label: string): Promise<{ seqno: number }>;
-  tonConnectAccount(): { address: string; chain: string; walletStateInit: string; publicKey: string };
+  /** boc — подписанное внешнее сообщение (base64), как его возвращает кошелёк через TON Connect */
+  send(messages: OutMessage[], label: string): Promise<{ seqno: number; boc: string }>;
+  tonConnectAccount(): TonConnectAccount;
+  /** Подпись TON Connect ton_proof — доказательство владения кошельком для входа на сайт */
+  tonProof(domain: string, payload: string, timestampSec?: number): TonProof;
+}
+
+/**
+ * ton_proof по спецификации TON Connect:
+ * message = "ton-proof-item-v2/" ‖ workchain(int32 BE) ‖ hash(32) ‖ len(domain)(uint32 LE) ‖ domain ‖ timestamp(uint64 LE) ‖ payload
+ * signature = ed25519( sha256( 0xffff ‖ "ton-connect" ‖ sha256(message) ) )
+ */
+export function buildTonProof(address: Address, secretKey: Buffer, domain: string, payload: string, timestampSec: number): TonProof {
+  const wc = Buffer.alloc(4);
+  wc.writeInt32BE(address.workChain);
+  const domainBuf = Buffer.from(domain, 'utf8');
+  const dlen = Buffer.alloc(4);
+  dlen.writeUInt32LE(domainBuf.length);
+  const ts = Buffer.alloc(8);
+  ts.writeBigUInt64LE(BigInt(timestampSec));
+  const message = Buffer.concat([Buffer.from('ton-proof-item-v2/'), wc, address.hash, dlen, domainBuf, ts, Buffer.from(payload, 'utf8')]);
+  const inner = createHash('sha256').update(message).digest();
+  const digest = createHash('sha256').update(Buffer.concat([Buffer.from([0xff, 0xff]), Buffer.from('ton-connect'), inner])).digest();
+  return {
+    timestamp: timestampSec,
+    domain: { lengthBytes: domainBuf.length, value: domain },
+    payload,
+    signature: sign(digest, secretKey).toString('base64'),
+  };
 }
 
 /**
@@ -60,7 +114,7 @@ export class ServiceWallet implements WalletLike {
     return this.client.getBalance(this.contract.address);
   }
 
-  tonConnectAccount() {
+  tonConnectAccount(): TonConnectAccount {
     const stateInit = beginCell().store(storeStateInit(this.contract.init)).endCell().toBoc().toString('base64');
     return {
       address: this.contract.address.toRawString(),
@@ -70,23 +124,36 @@ export class ServiceWallet implements WalletLike {
     };
   }
 
-  send(messages: OutMessage[], label: string): Promise<{ seqno: number }> {
+  tonProof(domain: string, payload: string, timestampSec = Math.floor(Date.now() / 1000)): TonProof {
+    return buildTonProof(this.contract.address, this.secretKey, domain, payload, timestampSec);
+  }
+
+  /** Подписанное внешнее сообщение — то же, что кошелёк отдаёт в TON Connect как `boc` */
+  buildTransferBoc(seqno: number, messages: OutMessage[]): string {
+    const createTransfer = this.contract.createTransfer.bind(this.contract) as unknown as (args: unknown) => Cell;
+    const transfer = createTransfer({
+      seqno,
+      secretKey: this.secretKey,
+      sendMode: SendMode.PAY_GAS_SEPARATELY | SendMode.IGNORE_ERRORS,
+      messages: messages.map((m) => internal({ to: Address.parse(m.to), value: m.value, body: m.body, bounce: bounceFlag(m) })),
+    });
+    const ext = external({ to: this.contract.address, init: seqno === 0 ? this.contract.init : undefined, body: transfer });
+    return beginCell().store(storeMessage(ext)).endCell().toBoc().toString('base64');
+  }
+
+  send(messages: OutMessage[], label: string): Promise<{ seqno: number; boc: string }> {
     const run = async () => {
       const opened = this.client.open(this.contract);
       const seqno = await opened.getSeqno();
       this.log.info({ label, seqno, count: messages.length }, 'wallet: sending');
-      await opened.sendTransfer({
-        seqno,
-        secretKey: this.secretKey,
-        sendMode: SendMode.PAY_GAS_SEPARATELY | SendMode.IGNORE_ERRORS,
-        messages: messages.map((m) => internal({ to: Address.parse(m.to), value: m.value, body: m.body, bounce: bounceFlag(m) })),
-      } as never);
+      const boc = this.buildTransferBoc(seqno, messages);
+      await this.client.sendFile(Buffer.from(boc, 'base64'));
       // ждём подтверждения: seqno должен увеличиться
       const deadline = Date.now() + 90_000;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 3000));
         try {
-          if ((await opened.getSeqno()) > seqno) return { seqno };
+          if ((await opened.getSeqno()) > seqno) return { seqno, boc };
         } catch (e) {
           this.log.warn({ err: String(e) }, 'wallet: seqno poll failed');
         }

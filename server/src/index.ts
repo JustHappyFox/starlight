@@ -13,6 +13,7 @@ import { ServiceWallet } from './ton/wallet.js';
 import { StonfiTreasury } from './treasury/index.js';
 import { MockProvider, type PrizeProvider } from './fulfillment/provider.js';
 import { FragmentProvider } from './fulfillment/fragment.js';
+import { FragmentSession } from './fulfillment/fragmentSession.js';
 import { startScheduler } from './services/scheduler.js';
 import type { AppContext } from './context.js';
 
@@ -61,10 +62,13 @@ async function main() {
   });
 
   let provider: PrizeProvider;
+  let fragment: FragmentSession | null = null;
   if (cfg.FULFILLMENT_PROVIDER === 'fragment') {
-    if (!cfg.FRAGMENT_COOKIES) throw new Error('FULFILLMENT_PROVIDER=fragment требует FRAGMENT_COOKIES');
-    if (!wallet && !cfg.FULFILLMENT_DRY_RUN) throw new Error('Выдача через Fragment требует TON_WALLET_MNEMONIC');
-    provider = new FragmentProvider({ cookies: cfg.FRAGMENT_COOKIES, hash: cfg.FRAGMENT_HASH, wallet, treasury, dryRun: cfg.FULFILLMENT_DRY_RUN, log });
+    // кошелёк нужен даже в dry-run: им выполняется вход на Fragment (ton_proof)
+    if (!wallet) throw new Error('Выдача через Fragment требует TON_WALLET_MNEMONIC');
+    fragment = new FragmentSession({ repo, wallet, log, seedCookies: cfg.FRAGMENT_COOKIES });
+    provider = new FragmentProvider({ session: fragment, wallet, treasury, dryRun: cfg.FULFILLMENT_DRY_RUN, log });
+    if (!fragment.state.telegram) log.warn('Fragment: нет входа Telegram — отправьте боту /fragment (из аккаунта админа)');
   } else {
     if (cfg.NODE_ENV === 'production') log.warn('FULFILLMENT_PROVIDER=mock в продакшене — призы НЕ выдаются!');
     provider = new MockProvider();
@@ -84,6 +88,7 @@ async function main() {
     receiveAddress,
     treasury,
     provider,
+    fragment,
   };
 
   registerHandlers(bot, ctx);

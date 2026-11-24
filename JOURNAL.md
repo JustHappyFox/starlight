@@ -20,17 +20,39 @@
 | `server/src/services/scheduler.ts` | Тик раз в N сек: платежи → публикация → счётчик → итоги → выдача |
 | `server/src/ton/*` | Комментарии-платежи, toncenter v3, сервисный кошелёк |
 | `server/src/treasury/index.ts` | Хедж TON→USDT→TON через STON.fi |
-| `server/src/fulfillment/*` | Выдача призов: Fragment / mock, очередь с ретраями |
+| `server/src/fulfillment/*` | Выдача призов: `fragmentSession.ts` (вход в Fragment), `fragment.ts` (покупка), `queue.ts` (очередь, получатель, срок) |
 | `server/src/bot/*` | grammY: /start, подключение каналов, контакт, админ-команды |
 | `webapp/src/pages/*` | Экраны мини-аппа (Preact) |
 | `shared/types.ts` | Типы API — общие для сервера и фронта |
 
-Проверка всего: `npm test` (сервер, 39 тестов) и `npm run typecheck`.
+Проверка всего: `npm test` (сервер, 47 тестов) и `npm run typecheck`.
 
 ---
 
 ## 1. Архитектурные решения (почему так)
 
+- **2026-11-24 — Fragment без ручных куки** (заменяет «куки из браузера в FRAGMENT_COOKIES»). Fragment для покупок
+  требует ДВА входа: кошельком (`stel_ton_token`) и Telegram-аккаунтом (`stel_token`). Кошелёк: сервер сам
+  подписывает TON Connect `ton_proof` (челлендж из `Wallet.init({ton_proof})` на fragment.com → `checkTonProofAuth`) —
+  полностью автоматически, при ошибке авторизации перевходит сам. Telegram: админ пишет боту `/fragment` →
+  «Войти через Telegram» → ссылка `t.me/oauth?startapp=…` → «Подтвердить» в Telegram → сервер завершает OAuth
+  (oauth.telegram.org, client_id 5444323279) и вызывает `logIn`. Куки хранятся в БД (`meta: fragment:cookies`),
+  все Set-Cookie подхватываются. Раз в 30 мин проверка сессии; если умерла — бот сам присылает админу кнопку входа.
+  Протокол сверен с открытым клиентом github.com/S1qwy/fragment-api-py; подпись ton_proof перекрёстно проверена его
+  алгоритмом на Python (pynacl). → `fulfillment/fragmentSession.ts`
+- **2026-11-24 — Сторонние «Fragment API» отклонены:** fragment-api.net просит **сид-фразу** кошелька (полный доступ
+  к деньгам); fragment-api-dev (duckdns-домен, анонимный автор) в основном режиме тоже берёт сид; S1qwy/fragment-api-py
+  берёт 1,5% с каждой покупки на адрес автора. Используем только как сверку протокола, свой код без комиссий.
+- **2026-11-24 — Пользователи без @username участвуют** (заменяет «username обязателен для участия»). Fragment
+  отправляет только по нику, поэтому ник спрашиваем лишь у победителя: статус `needs_username` + `issue`
+  (`no_username` | `not_found` | `ineligible`). Победитель в мини-аппе: «на мой @ник» или «на другой аккаунт»
+  (бот сначала показывает имя получателя из Fragment — `POST /api/g/:id/claim/check`, затем `/claim`). Свой ник
+  появился — бот заметит сам (getChat) или по кнопке «Я поставил username». Напоминание за сутки.
+  `CLAIM_WINDOW_DAYS` вышел → `unclaimed` → **доразыгрыш** (`draw.ts: redrawGiveaway`) тем же протоколом:
+  те же seed/энтропия/замороженный список, порядок выбора билетов тот же, не забравший помечается
+  `disqualified: unclaimed`, поток продолжается — `verifyProof` проходит. Новый победитель получает то же место.
+- **2026-11-24 — Premium нельзя подарить тому, у кого он уже активен** (Fragment: «already has Premium» /
+  `PREMIUM_ALREADY_ACTIVE`). Это `ineligible` → победитель указывает другой аккаунт (тот же экран).
 - **2026-11-24 — После оплаты пост НЕ публикуется сам** (заменяет прежнее «публикация сразу после оплаты»).
   Статусы: `draft → paid → scheduled → active`. В `paid` организатор жмёт «Опубликовать»: «Сейчас» или
   «По расписанию» — дата и время по часам его телефона (`datetime-local` → ms UTC). Пока пост не вышел, время
@@ -114,7 +136,25 @@
 - **2026-11-24 — Тест на гонку должен реально её воспроизводить:** `Promise.all` с API и тиком выстраивался
   последовательно и проходил без блокировки. Проверено: тест падает без блокировки (2 поста), проходит с ней.
 
+- **2026-11-24 — Протокол покупки Fragment** (было неполно): перед поиском `update…State {mode:new}`; в поиске
+  звёзд `quantity` **пустой**; в init — `payment_method=ton`; после перевода — `confirmReq` с **подписанным BOC**
+  (кошелёк теперь собирает внешнее сообщение сам и отдаёт boc) и опрос `update…State {id}` до `mode=done,
+  need_update=false`. Только это значит «доставлено»; без подтверждения — `sent` с пометкой в `last_error`.
+- **2026-11-24 — Ошибка `auth` от Fragment не тратит попытки выдачи** — это проблема нашей сессии, а не приза:
+  выдача ждёт 10 мин, админу — кнопка входа (не чаще раза в 6 ч, ключ `alert:fragment_auth`).
+- **2026-11-24 — Риск: TLS-отпечаток.** Обе открытые библиотеки ходят на fragment.com через curl_cffi
+  «как Chrome». Если Fragment начнёт отвечать 403/капчей на запросы Node fetch — нужен транспорт с браузерным
+  отпечатком (curl-impersonate или запросы из headless Chromium). С живым Fragment не проверено.
+- **2026-11-24 — Поле получателя принимает `@nick`, `nick`, `t.me/nick`, `https://t.me/nick`** — ссылка без схемы
+  сначала не проходила (поймано тестом).
+
 ### Тесты / окружение разработки
+- **2026-11-24 — Тест с доразыгрышем был нестабилен** (seed случайный → иногда замена тоже без ника). Детерминируем:
+  подбираем seed через `runDraw`, чтобы первым выиграл нужный участник. Тесты со случайностью — только так.
+- **2026-11-24 — `FakeTg.getChat` ведёт себя как Telegram:** неизвестный пользователь → ошибка `chat not found`.
+  Раньше фейк отвечал «нет ника» всем, и новая логика (ник пропал → обновить) ломала тесты.
+- **2026-11-24 — Публичный GitHub читается** `git clone --depth 1` (через git-прокси), пакеты — через npm/PyPI.
+  Не говорить пользователю «не могу открыть ссылку», не попробовав это. Чужой код — в отдельную папку, только читать.
 - **2026-11-24 — `openSingleWalletModal` помечен в @tonconnect/ui 2.4 как experimental.** При обновлении
   библиотеки проверить, что метод на месте. Список кошельков грузится с config.ton.org; без сети SDK берёт
   встроенный `FALLBACK_WALLETS_LIST`, где `telegram-wallet` есть.
@@ -137,11 +177,10 @@
 
 Код написан и покрыт тестами на моках, но **с живыми сервисами не запускался** (в среде разработки не было сети).
 
-1. **Fragment** (`fulfillment/fragment.ts`): методы `searchStarsRecipient / initBuyStarsRequest / getBuyStarsLink`
-   и `searchPremiumGiftRecipient / initGiftPremiumRequest / getGiftPremiumLink`, параметры `account`/`device`
-   (TON Connect), извлечение `hash` со страницы. Официального API нет — формат может меняться. Первый запуск —
-   `FULFILLMENT_DRY_RUN=true` на 1 приз 50⭐ и сверить логи; затем боевой режим на себе.
-   Возможно, Fragment потребует KYC для покупки в пользу других — проверить в аккаунте.
+1. **Fragment** (`fulfillment/fragment*.ts`): протокол сверен с S1qwy/fragment-api-py (v14.5.0), но с живым
+   сайтом не запускался. По описаниям сторонних обёрток покупка через **свой** аккаунт Fragment требует **KYC** —
+   пройти на fragment.com заранее. Первый запуск: `/fragment` → вход → `FULFILLMENT_DRY_RUN=true` на 1 приз 50⭐,
+   сверить логи; затем боевой режим на себе. Возможная проблема — TLS-отпечаток (см. «Грабли»).
 2. **Ответ `requestContact`** (`response`) подписан тем же алгоритмом, что initData. Если нет — работает
    запасной путь: контакт приходит боту сообщением (`message:contact`), фронт опрашивает статус.
 3. **toncenter v3**: поля `in_msg.message_content.decoded.comment`, `in_msg.value`, `description.aborted`,
@@ -159,7 +198,7 @@
 - [ ] BotFather: домен мини-аппа (`/setdomain` или Main Mini App), `/newapp` → `MINIAPP_SHORT_NAME` (или main app)
 - [ ] `PUBLIC_URL` — HTTPS; `BOT_MODE=webhook` + `WEBHOOK_SECRET` (или polling)
 - [ ] `TON_WALLET_MNEMONIC` отдельного кошелька, `TONCENTER_API_KEY`
-- [ ] Fragment: вход тем же кошельком, cookies в `FRAGMENT_COOKIES`, тест в dry-run → боевой
+- [ ] Fragment: KYC на fragment.com; в боте `/fragment` → «Войти через Telegram»; тест в dry-run → боевой
 - [ ] `TREASURY_MODE` и `TREASURY_DRY_RUN=false` только после теста свопа на малой сумме
 - [ ] `ADMIN_IDS` — получать уведомления о сбоях/возвратах
 - [ ] Бэкап `data/starlight.db` (SQLite в WAL: копировать через `sqlite3 .backup`)

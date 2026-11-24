@@ -2,10 +2,17 @@ import type { AppContext } from '../context.js';
 import type { GiveawayRow } from '../db/repo.js';
 import { escapeHtml, sanitizeTelegramHtml } from '../util/html.js';
 
-export function prizeLabel(type: string, amount: number, html = true): string {
+export function prizeLabel(type: string, amount: number): string {
   if (type === 'stars') return `${amount.toLocaleString('ru-RU')} ⭐ Telegram Stars`;
-  const m = amount === 12 ? '12 месяцев' : `${amount} месяцев`;
-  return html ? `Telegram Premium на ${m}` : `Telegram Premium на ${m}`;
+  return `Telegram Premium на ${amount} ${monthsWord(amount)}`;
+}
+
+export function monthsWord(n: number): string {
+  const d = n % 10;
+  const dd = n % 100;
+  if (d === 1 && dd !== 11) return 'месяц';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'месяца';
+  return 'месяцев';
 }
 
 export function winnersWord(n: number): string {
@@ -44,8 +51,7 @@ export function renderPost(g: GiveawayRow): string {
   if (g.require_subscription) cond.push('подписка на канал');
   const countries = countryList(g.countries);
   if (countries) cond.push(`страны: ${countries.join(', ')}`);
-  cond.push('публичный @username');
-  lines.push(`✅ <b>Условия:</b> ${escapeHtml(cond.join(' · '))}`);
+  lines.push(cond.length ? `✅ <b>Условия:</b> ${escapeHtml(cond.join(' · '))}` : '✅ <b>Условия:</b> просто нажмите кнопку ниже');
   lines.push('👥 Приглашайте друзей по своей ссылке — каждый друг даёт +1 билет.');
   lines.push('🛡 Призы оплачены заранее и выдаются ботом автоматически.');
   lines.push(`🔐 Хеш честности: <code>${g.seed_hash.slice(0, 16)}…</code>`);

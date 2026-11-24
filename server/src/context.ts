@@ -9,6 +9,7 @@ import type { TonCenter } from './ton/toncenter.js';
 import type { WalletLike } from './ton/wallet.js';
 import type { Treasury } from './treasury/index.js';
 import type { PrizeProvider } from './fulfillment/provider.js';
+import type { FragmentSession } from './fulfillment/fragmentSession.js';
 
 /** Подмножество Bot API, которым пользуется приложение (в тестах подменяется фейком) */
 export type TgApi = Pick<
@@ -31,4 +32,6 @@ export interface AppContext {
   receiveAddress: string | null;
   treasury: Treasury;
   provider: PrizeProvider;
+  /** Сессия fragment.com (только при FULFILLMENT_PROVIDER=fragment) */
+  fragment: FragmentSession | null;
 }

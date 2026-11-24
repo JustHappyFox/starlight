@@ -8,6 +8,7 @@ import type {
   GiveawayOwnerView,
   InvoiceView,
   JoinRequest,
+  MyPrizeView,
   Phase,
   PublicGiveawayView,
   WinnerView,
@@ -295,6 +296,15 @@ export function publicView(ctx: AppContext, g: GiveawayRow, user: UserRow): Publ
   const countries = countryList(g.countries);
   const phoneCountry = user.phone_country && user.phone_country !== 'XX' ? user.phone_country : null;
   const finished = g.status === 'finished';
+  const win = finished ? ctx.repo.getWinner(g.id, user.id) : undefined;
+  const prize: MyPrizeView | null = win
+    ? {
+        status: win.status,
+        issue: win.issue,
+        deadline: win.created_at + ctx.cfg.CLAIM_WINDOW_DAYS * 86_400_000,
+        recipient: win.recipient ?? win.username_used ?? user.username,
+      }
+    : null;
   return {
     id: g.id,
     phase: phaseOf(g, now),
@@ -317,7 +327,8 @@ export function publicView(ctx: AppContext, g: GiveawayRow, user: UserRow): Publ
       hasUsername: !!user.username,
       phoneCountry,
       countryOk: isCountryAllowed(countries, phoneCountry),
-      isWinner: finished && !!ctx.repo.getWinner(g.id, user.id),
+      isWinner: !!win && win.status !== 'unclaimed',
+      prize,
     },
     results: finished ? { drawnAt: g.drawn_at ?? g.ends_at, winners: winnersView(ctx, g.id), proofAvailable: !!g.proof } : null,
   };
@@ -394,8 +405,6 @@ export async function join(
     return { kind: 'already', view: publicView(ctx, g, user) };
   }
 
-  if (!user.username) throw new AppError('need_username', 'Чтобы получить приз, нужен публичный @username. Установите его в настройках Telegram и откройте розыгрыш снова.');
-
   const countries = countryList(g.countries);
   if (countries) {
     if (!user.phone_country) throw new AppError('need_phone', 'Розыгрыш доступен только для некоторых стран — подтвердите номер телефона');
@@ -463,4 +472,59 @@ export function applyContact(ctx: AppContext, userId: number, contact: { user_id
   const country = countryFromPhone(contact.phone_number) ?? 'XX';
   ctx.repo.setPhoneCountry(userId, country, ctx.now());
   return country;
+}
+
+
+// ---------- получение приза: свой ник или другой аккаунт ----------
+
+const USERNAME_RE = /^[A-Za-z][A-Za-z0-9_]{3,31}$/;
+
+export function normalizeUsername(raw: string): string {
+  const u = raw.trim().replace(/^(https?:\/\/)?t\.me\//i, '').replace(/^@/, '').replace(/\/$/, '');
+  if (!USERNAME_RE.test(u)) throw new AppError('bad_request', 'Укажите username: латиница, цифры и _, от 4 до 32 символов');
+  return u;
+}
+
+function claimableWinner(ctx: AppContext, g: GiveawayRow, userId: number) {
+  const w = g.status === 'finished' ? ctx.repo.getWinner(g.id, userId) : undefined;
+  if (!w) throw new AppError('not_found', 'Вы не победитель этого розыгрыша', 404);
+  if (w.status !== 'needs_username') throw new AppError('locked', w.status === 'sent' ? 'Приз уже отправлен' : 'Приз уже в обработке', 409);
+  return w;
+}
+
+async function lookupRecipient(ctx: AppContext, g: GiveawayRow, username: string): Promise<string> {
+  try {
+    return (await ctx.provider.lookup({ type: g.prize_type, amount: g.prize_amount, username })).name;
+  } catch (e) {
+    const kind = (e as { kind?: string }).kind;
+    if (kind === 'recipient') throw new AppError('bad_request', `Аккаунт @${username} не найден`);
+    if (kind === 'ineligible') throw new AppError('bad_request', `@${username} не может получить этот приз — например, у него уже есть Premium. Укажите другой аккаунт.`);
+    ctx.log.warn({ gid: g.id, err: String(e) }, 'recipient lookup failed');
+    throw new AppError('internal', 'Сервис выдачи сейчас недоступен — попробуйте через несколько минут', 503);
+  }
+}
+
+/** Показать победителю, кому уйдёт приз, до подтверждения */
+export async function checkRecipient(ctx: AppContext, g: GiveawayRow, user: UserRow, raw: string) {
+  claimableWinner(ctx, g, user.id);
+  const username = normalizeUsername(raw);
+  return { username, name: await lookupRecipient(ctx, g, username) };
+}
+
+/**
+ * Победитель выбрал получателя: свой аккаунт (username = null — нужен свой ник) или другой.
+ * После этого приз уходит в очередь выдачи.
+ */
+export async function claimPrize(ctx: AppContext, g: GiveawayRow, user: UserRow, raw: string | null) {
+  const w = claimableWinner(ctx, g, user.id);
+  let recipient: string | null = null;
+  if (raw) {
+    recipient = normalizeUsername(raw);
+    await lookupRecipient(ctx, g, recipient);
+  } else {
+    if (!user.username) throw new AppError('need_username', 'У вас всё ещё нет @username — поставьте его или укажите другой аккаунт');
+    if (w.issue === 'ineligible' || w.issue === 'not_found') await lookupRecipient(ctx, g, user.username);
+  }
+  ctx.repo.updateWinner(g.id, user.id, { status: 'pending', recipient, issue: null, next_attempt_at: 0, last_error: null }, ctx.now());
+  return publicView(ctx, ctx.repo.getGiveaway(g.id)!, ctx.repo.getUser(user.id)!);
 }

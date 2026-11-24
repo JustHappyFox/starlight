@@ -69,8 +69,11 @@ const schema = z.object({
 
   // --- Выдача призов ---
   FULFILLMENT_PROVIDER: z.enum(['mock', 'fragment']).default('mock'),
+  /** Необязательно: стартовые куки fragment.com. Обычно не нужны — вход делается командой /fragment в боте */
   FRAGMENT_COOKIES: z.string().optional(),
-  FRAGMENT_HASH: z.string().optional(),
+  /** Публичный username для проверки, что сессия Fragment жива */
+  FRAGMENT_HEALTH_USERNAME: z.string().default('durov'),
+  FRAGMENT_HEALTH_INTERVAL_MIN: num(30),
   FULFILLMENT_DRY_RUN: bool(true),
   FULFILLMENT_MAX_ATTEMPTS: num(8),
   CLAIM_WINDOW_DAYS: num(7),

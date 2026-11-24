@@ -124,6 +124,18 @@ export async function refreshButton(ctx: AppContext, g: GiveawayRow) {
   ctx.repo.updateGiveaway(g.id, { button_count: g.participants_count, button_updated_at: now }, now);
 }
 
+/** Проверка сессии Fragment; если умерла и не восстановилась сама — кнопка входа админам (не чаще раза в 6 ч) */
+async function checkFragment(ctx: AppContext) {
+  const f = ctx.fragment!;
+  if (await f.healthCheck(ctx.cfg.FRAGMENT_HEALTH_USERNAME, ctx.now())) return;
+  const key = 'alert:fragment_auth';
+  if (ctx.now() - Number(ctx.repo.getMeta(key) ?? 0) < 6 * 3_600_000) return;
+  ctx.repo.setMeta(key, String(ctx.now()));
+  await notifyAdmins(ctx, `🔑 Fragment: сессия не работает — выдача призов на паузе.\n${escapeHtml(f.state.lastError ?? '')}`, {
+    inline_keyboard: [[{ text: '🔑 Войти в Fragment', callback_data: 'fraglogin' }]],
+  });
+}
+
 export interface SchedulerHandle {
   stop(): void;
   tick(): Promise<void>;
@@ -132,6 +144,7 @@ export interface SchedulerHandle {
 export function startScheduler(ctx: AppContext, opts: { autoStart?: boolean } = {}): SchedulerHandle {
   let running = false;
   let lastPaymentPoll = 0;
+  let lastFragmentCheck = 0;
   let timer: NodeJS.Timeout | null = null;
 
   const step = async (name: string, fn: () => Promise<unknown>) => {
@@ -165,6 +178,10 @@ export function startScheduler(ctx: AppContext, opts: { autoStart?: boolean } = 
         else await step(`button:${g.id}`, () => refreshButton(ctx, g));
       }
       for (const g of ctx.repo.listByStatus('drawing')) await step(`redraw:${g.id}`, () => drawGiveaway(ctx, g.id));
+      if (ctx.fragment && now - lastFragmentCheck >= ctx.cfg.FRAGMENT_HEALTH_INTERVAL_MIN * 60_000) {
+        lastFragmentCheck = now;
+        await step('fragment-health', () => checkFragment(ctx));
+      }
       await step('deliveries', () => processDeliveries(ctx));
       await step('purge', async () => ctx.repo.purgeCaptchas(now - 3_600_000));
     } finally {

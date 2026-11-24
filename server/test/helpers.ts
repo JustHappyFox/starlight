@@ -36,6 +36,8 @@ export class FakeTg {
   });
   getChat = (async (chatId: number | string) => {
     if (typeof chatId === 'string') return { id: CHANNEL_ID, type: 'channel', title: 'Test Channel', username: chatId.replace('@', '') };
+    // как настоящий Telegram: о пользователе, которого бот «не видел», — ошибка chat not found
+    if (!this.usernames.has(Number(chatId))) throw new Error('Bad Request: chat not found');
     return { id: chatId, type: 'private', username: this.usernames.get(Number(chatId)) };
   });
   getMe = (async () => ({ id: BOT_ID, is_bot: true, first_name: 'Bot', username: 'test_bot' }));
@@ -95,6 +97,7 @@ export function makeEnv(env: Record<string, string> = {}): TestEnv {
     receiveAddress: 'UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XggGG',
     treasury: new NoopTreasury(),
     provider,
+    fragment: null,
   };
   return {
     ctx,

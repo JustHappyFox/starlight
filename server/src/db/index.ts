@@ -184,6 +184,12 @@ const MIGRATIONS: string[] = [
     created_at INTEGER NOT NULL
   );
   `,
+  // 2: получатель приза может отличаться от победителя (нет ника / Premium уже активен)
+  `
+  ALTER TABLE winners ADD COLUMN recipient TEXT;
+  ALTER TABLE winners ADD COLUMN issue TEXT;
+  ALTER TABLE winners ADD COLUMN reminded INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 export function openDb(path: string): DB {

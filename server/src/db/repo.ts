@@ -106,9 +106,16 @@ export interface WinnerRow {
   cost_nano: string | null;
   last_error: string | null;
   notified: number;
+  /** Username получателя, если победитель указал другой аккаунт */
+  recipient: string | null;
+  /** Почему приз ждёт действия победителя */
+  issue: WinnerIssue | null;
+  reminded: number;
   created_at: number;
   updated_at: number;
 }
+
+export type WinnerIssue = 'no_username' | 'not_found' | 'ineligible';
 
 export interface CaptchaRow {
   id: string;
@@ -405,6 +412,10 @@ export class Repo {
   }
   getWinner(gid: string, uid: number): WinnerRow | undefined {
     return this.db.prepare('SELECT * FROM winners WHERE giveaway_id = ? AND user_id = ?').get(gid, uid) as WinnerRow | undefined;
+  }
+  /** Все участники (в т.ч. забаненные) — для сопоставления псевдонимов при доразыгрыше */
+  participantIds(gid: string): number[] {
+    return (this.db.prepare('SELECT user_id FROM participants WHERE giveaway_id = ?').all(gid) as { user_id: number }[]).map((r) => r.user_id);
   }
   dueWinners(now: number, limit = 10): WinnerRow[] {
     return this.db

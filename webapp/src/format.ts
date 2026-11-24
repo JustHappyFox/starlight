@@ -7,7 +7,7 @@ export function prizeTitle(type: PrizeType, amount: number): string {
 
 export function prizeLong(type: PrizeType, amount: number): string {
   if (type === 'stars') return `${amount.toLocaleString('ru-RU')} Telegram Stars`;
-  return `Telegram Premium на ${amount} месяцев`;
+  return `Telegram Premium на ${amount} ${plural(amount, 'месяц', 'месяца', 'месяцев')}`;
 }
 
 export function plural(n: number, one: string, few: string, many: string): string {
@@ -63,6 +63,7 @@ export const PRIZE_STATUS: Record<string, string> = {
   pending: 'в очереди',
   processing: 'отправляется',
   sent: 'отправлен ✓',
-  needs_username: 'нужен username',
+  needs_username: 'ждём получателя',
+  unclaimed: 'не забран — доразыгран',
   failed: 'ошибка',
 };

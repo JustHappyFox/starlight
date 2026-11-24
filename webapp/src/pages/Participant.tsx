@@ -6,6 +6,7 @@ import { alertMsg, copyText, haptic, inTelegram, shareLink, tg } from '../tg';
 import { PRIZE_STATUS, dateTime, left, plural, prizeLong } from '../format';
 import { countryName, flag } from '../countries';
 import type { CaptchaChallenge, PublicGiveawayView } from '../../../shared/types';
+import { PrizeClaim } from './PrizeClaim';
 
 export function Participant(props: { id: string; refCode: string | null }) {
   const [view, setView] = useState<PublicGiveawayView | null>(null);
@@ -196,7 +197,11 @@ export function Participant(props: { id: string; refCode: string | null }) {
       {view.phase === 'active' && !me.joined && (
         <>
           <Section title="Условия">
-            <Row icon={me.hasUsername ? '✅' : '⚠️'} label="Публичный @username" hint={me.hasUsername ? 'Есть — на него придёт приз' : 'Настройки Telegram → Имя пользователя. Без него приз не отправить.'} />
+            <Row
+              icon={me.hasUsername ? '✅' : 'ℹ️'}
+              label={me.hasUsername ? 'Приз придёт на ваш @username' : 'У вас нет @username'}
+              hint={me.hasUsername ? undefined : 'Участвовать можно. Если выиграете — поставите ник или укажете другой аккаунт для приза.'}
+            />
             {view.requireSubscription && (
               <Row icon="📣" label={`Подписка на «${view.channel.title}»`} hint="Проверим при участии и перед выдачей приза" onClick={view.channel.url ? () => tg.openTelegramLink(view.channel.url!) : undefined} right={view.channel.url ? 'Открыть' : undefined} />
             )}
@@ -292,7 +297,7 @@ export function Participant(props: { id: string; refCode: string | null }) {
       {/* ---------- результаты ---------- */}
       {view.phase === 'finished' && view.results && (
         <>
-          {me.isWinner && <Notice kind="success">🎉 Вы победили! Приз отправим на ваш @username автоматически.</Notice>}
+          {me.prize && <PrizeClaim gid={props.id} view={view} onView={setView} />}
           <Section title={`Победители (${view.results.winners.length})`}>
             {view.results.winners.length === 0 && <p class="empty">Победителей нет.</p>}
             {view.results.winners.map((w) => (

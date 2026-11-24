@@ -8,7 +8,7 @@ import { isAdmin } from '../services/notify.js';
 import { requeueWinner, stuckProcessing } from '../fulfillment/queue.js';
 import { markPaidManually } from '../ton/payments.js';
 import { schedulePublish } from '../services/scheduler.js';
-import { AppError } from '../services/giveaways.js';
+import { AppError, claimPrize } from '../services/giveaways.js';
 import { escapeHtml } from '../util/html.js';
 import { formatTon } from '../services/pricing.js';
 
@@ -113,17 +113,79 @@ export function registerHandlers(bot: Bot, ctx: AppContext) {
     }
   });
 
+  // «Я поставил username» из сообщения победителю
   bot.callbackQuery(/^claim:([A-Za-z0-9]+)$/, async (c) => {
     const gid = c.match[1]!;
-    const w = repo.getWinner(gid, c.from.id);
-    if (!w) return c.answerCallbackQuery({ text: 'Приз не найден' });
-    if (!c.from.username) return c.answerCallbackQuery({ text: 'Username всё ещё не установлен', show_alert: true });
-    requeueWinner(ctx, gid, c.from.id);
-    await c.answerCallbackQuery({ text: 'Отправляем приз — это займёт пару минут' });
+    const g = repo.getGiveaway(gid);
+    const user = repo.getUser(c.from.id);
+    if (!g || !user) return c.answerCallbackQuery({ text: 'Приз не найден' });
+    if (!c.from.username) return c.answerCallbackQuery({ text: 'Username всё ещё не установлен. Или укажите другой аккаунт в приложении.', show_alert: true });
+    try {
+      await claimPrize(ctx, g, user, null);
+      await c.answerCallbackQuery({ text: 'Отправляем приз — это займёт пару минут' });
+    } catch (e) {
+      await c.answerCallbackQuery({ text: e instanceof AppError ? e.message.slice(0, 190) : 'Ошибка, попробуйте в приложении', show_alert: true });
+    }
+  });
+
+  const admin = bot.filter((c) => !!c.from && isAdmin(ctx, c.from.id) && c.chat?.type === 'private');
+
+  // ---------- вход в Fragment (вместо ручных куки) ----------
+  const fragmentStatus = () => {
+    const f = ctx.fragment;
+    if (!f) return 'Выдача через Fragment выключена (FULFILLMENT_PROVIDER).';
+    const s = f.state;
+    const yes = (b: boolean) => (b ? '✅' : '❌');
+    return [
+      '<b>Fragment</b>',
+      `${yes(s.wallet)} вход кошельком (обновляется автоматически)`,
+      `${yes(s.telegram)} вход Telegram-аккаунтом`,
+      s.lastCheckAt ? `${s.lastCheckOk ? '✅' : '⚠️'} проверка ${new Date(s.lastCheckAt).toISOString().slice(0, 16).replace('T', ' ')} UTC${s.lastError ? `: ${escapeHtml(s.lastError)}` : ''}` : '— проверки ещё не было',
+      ctx.cfg.FULFILLMENT_DRY_RUN ? '\n🧪 FULFILLMENT_DRY_RUN=true — переводы не отправляются' : '',
+    ].join('\n');
+  };
+  const fragmentKb = () =>
+    new InlineKeyboard().text('🔑 Войти через Telegram', 'fraglogin').row().text('🔄 Проверить', 'fragcheck');
+
+  admin.command('fragment', async (c) => {
+    await c.reply(fragmentStatus(), { parse_mode: 'HTML', reply_markup: ctx.fragment ? fragmentKb() : undefined });
+  });
+
+  let loginRunning = false;
+  bot.callbackQuery('fraglogin', async (c) => {
+    if (!isAdmin(ctx, c.from.id) || !ctx.fragment) return c.answerCallbackQuery();
+    if (loginRunning) return c.answerCallbackQuery({ text: 'Вход уже идёт — подтвердите его в Telegram' });
+    await c.answerCallbackQuery({ text: 'Готовим вход…' });
+    loginRunning = true;
+    const chatId = c.from.id;
+    let msgId: number | null = null;
+    void ctx.fragment
+      .telegramLogin(async (link) => {
+        const text = '🔑 <b>Вход в Fragment</b>\n\nНажмите кнопку и подтвердите вход в Telegram (тем аккаунтом, к которому привязан Fragment). Ссылка действует несколько минут.';
+        const kb = new InlineKeyboard().url('✅ Подтвердить вход', link);
+        if (msgId) await c.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => undefined);
+        else msgId = (await c.api.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb })).message_id;
+      })
+      .then(async () => {
+        const ok = await ctx.fragment!.healthCheck(ctx.cfg.FRAGMENT_HEALTH_USERNAME, ctx.now());
+        await c.api.sendMessage(chatId, ok ? '✅ Fragment подключён, выдача призов продолжится автоматически.' : `⚠️ Вход выполнен, но проверка не прошла:\n${escapeHtml(ctx.fragment!.state.lastError ?? '')}`, { parse_mode: 'HTML' });
+      })
+      .catch(async (e) => {
+        await c.api.sendMessage(chatId, `❌ Вход не выполнен: ${escapeHtml(String((e as Error)?.message ?? e))}`, { parse_mode: 'HTML' });
+      })
+      .finally(() => {
+        loginRunning = false;
+      });
+  });
+
+  bot.callbackQuery('fragcheck', async (c) => {
+    if (!isAdmin(ctx, c.from.id) || !ctx.fragment) return c.answerCallbackQuery();
+    await c.answerCallbackQuery({ text: 'Проверяем…' });
+    await ctx.fragment.healthCheck(ctx.cfg.FRAGMENT_HEALTH_USERNAME, ctx.now());
+    await c.editMessageText(fragmentStatus(), { parse_mode: 'HTML', reply_markup: fragmentKb() }).catch(() => undefined);
   });
 
   // ---------- админ ----------
-  const admin = bot.filter((c) => !!c.from && isAdmin(ctx, c.from.id) && c.chat?.type === 'private');
 
   admin.command('stats', async (c) => {
     const s = repo.stats();

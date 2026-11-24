@@ -22,8 +22,8 @@ export async function dm(ctx: AppContext, userId: number, html: string, markup?:
   }
 }
 
-export async function notifyAdmins(ctx: AppContext, html: string) {
-  for (const id of ctx.cfg.ADMIN_IDS) await dm(ctx, id, html);
+export async function notifyAdmins(ctx: AppContext, html: string, markup?: Markup) {
+  for (const id of ctx.cfg.ADMIN_IDS) await dm(ctx, id, html, markup);
 }
 
 export function isAdmin(ctx: AppContext, userId: number) {

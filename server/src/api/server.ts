@@ -12,6 +12,8 @@ import { InitDataError, signInitData, validateInitData, verifySignedQuery, type 
 import {
   AppError,
   applyContact,
+  checkRecipient,
+  claimPrize,
   cancelDraft,
   createChallenge,
   createGiveaway,
@@ -231,6 +233,17 @@ export async function buildServer(ctx: AppContext, opts: ApiOptions = {}): Promi
     );
     if (r.kind === 'decoy') return { ok: true };
     return r.view;
+  });
+
+  // Победитель без ника / с активным Premium: выбрать, на какой аккаунт отправить приз
+  app.post<{ Params: { id: string }; Body: { username?: string } }>('/api/g/:id/claim/check', async (req) => {
+    if (!joinLimiter.allow(`cc:${user(req).id}`)) throw new AppError('rate_limited', 'Слишком много проверок, подождите минуту', 429);
+    return checkRecipient(ctx, getPublicGiveaway(ctx, req.params.id), user(req), String(req.body?.username ?? ''));
+  });
+  app.post<{ Params: { id: string }; Body: { username?: string | null } }>('/api/g/:id/claim', async (req) => {
+    if (!joinLimiter.allow(`cl:${user(req).id}`)) throw new AppError('rate_limited', 'Слишком много попыток, подождите минуту', 429);
+    const raw = req.body?.username;
+    return claimPrize(ctx, getPublicGiveaway(ctx, req.params.id), user(req), typeof raw === 'string' && raw.trim() ? raw : null);
   });
 
   // Ловушки. Невидимая кнопка в интерфейсе шлёт сюда; «очевидный» эндпоинт /participate

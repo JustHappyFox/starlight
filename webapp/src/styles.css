@@ -328,6 +328,9 @@ h1 {
   gap: 8px;
   padding: 8px 16px 12px;
 }
+.inline-form.flush {
+  padding: 0;
+}
 .price-line {
   display: flex;
   justify-content: space-between;

@@ -5,7 +5,8 @@ import { buildServer } from '../src/api/server.js';
 import { onBotMembership } from '../src/bot/channels.js';
 import { publishGiveaway, startScheduler } from '../src/services/scheduler.js';
 import { handleTx } from '../src/ton/payments.js';
-import { verifyProof } from '../../shared/fairness.js';
+import { pseudonym, runDraw, verifyProof } from '../../shared/fairness.js';
+import { DeliveryError } from '../src/fulfillment/provider.js';
 import type { DrawProof, GiveawayOwnerView, InvoiceView, PublicGiveawayView } from '../../shared/types.js';
 import { baseInput, CHANNEL_ID, makeEnv, type TestEnv } from './helpers.js';
 
@@ -187,7 +188,8 @@ describe('полный сценарий', () => {
   it('предусловия: username, подписка, страна', async () => {
     const { env, app } = s;
     const { g } = await createPaidActive(env, app, { countries: ['KZ'], captcha: false });
-    expect((await api(app, env, { id: 301 }).post(`/api/g/${g.id}/join`)).json().error.code).toBe('need_username');
+    // без ника участвовать можно (ник/получателя спросим только у победителя), но страна — обязательна
+    expect((await api(app, env, { id: 301 }).post(`/api/g/${g.id}/join`)).json().error.code).toBe('need_phone');
     expect((await api(app, env, { id: 302, username: 'u302' }).post(`/api/g/${g.id}/join`)).json().error.code).toBe('need_phone');
     env.ctx.repo.setPhoneCountry(302, 'RU', env.clock.t);
     expect((await api(app, env, { id: 302, username: 'u302' }).post(`/api/g/${g.id}/join`)).json().error.code).toBe('country_not_allowed');
@@ -249,7 +251,8 @@ describe('полный сценарий', () => {
     expect(env.tg.sent.some((m) => m.chatId === 501 && m.text.includes('нет публичного @username'))).toBe(true);
     env.tg.usernames.set(501, 'new501');
     env.clock.advance(7 * 3_600_000);
-    await sched.tick();
+    await sched.tick(); // заметили новый ник → в очередь
+    await sched.tick(); // отправили
     expect(env.provider.delivered.at(-1)!.username).toBe('new501');
   });
 });
@@ -341,5 +344,122 @@ describe('публикация после оплаты', () => {
     expect(repo.getGiveaway(g.id)!.status).toBe('cancelled');
     expect(repo.openRefunds()[0]!.usd_cents).toBe(g.priceUsd * 100);
     expect(env.tg.channelPosts()).toHaveLength(0);
+  });
+});
+
+describe('приз без ника: другой аккаунт, срок, доразыгрыш', () => {
+  let s: Awaited<ReturnType<typeof setup>>;
+  beforeEach(async () => {
+    s = await setup();
+  });
+
+  async function finishedWith(env: TestEnv, app: FastifyInstance, players: { id: number; username?: string }[], input: Record<string, unknown> = {}) {
+    const { g, sched } = await createPaidActive(env, app, { captcha: false, requireSubscription: false, ...input });
+    for (const p of players) {
+      const r = await api(app, env, p).post(`/api/g/${g.id}/join`);
+      expect(r.statusCode, r.body).toBe(200);
+    }
+    env.clock.advance(3 * 86_400_000);
+    await sched.tick(); // итоги
+    return { g, sched };
+  }
+
+  it('участвует без ника; победив, указывает аккаунт друга — приз уходит туда', async () => {
+    const { env, app } = s;
+    const { g, sched } = await finishedWith(env, app, [{ id: 601 }], { winnersCount: 1 });
+    await sched.tick();
+    const u = api(app, env, { id: 601 });
+    let v = (await u.get(`/api/g/${g.id}`)).json() as PublicGiveawayView;
+    expect(v.me.prize).toMatchObject({ status: 'needs_username', issue: 'no_username' });
+    expect(env.tg.sent.some((m) => m.chatId === 601 && m.text.includes('укажите в приложении другой аккаунт'))).toBe(true);
+
+    const check = await u.post(`/api/g/${g.id}/claim/check`, { username: 't.me/best_friend' });
+    expect(check.json()).toEqual({ username: 'best_friend', name: 'Пользователь @best_friend' });
+    expect((await u.post(`/api/g/${g.id}/claim/check`, { username: 'a b' })).statusCode).toBe(400);
+    // свой аккаунт без ника выбрать нельзя
+    expect((await u.post(`/api/g/${g.id}/claim`, {})).json().error.code).toBe('need_username');
+
+    v = (await u.post(`/api/g/${g.id}/claim`, { username: '@best_friend' })).json() as PublicGiveawayView;
+    expect(v.me.prize).toMatchObject({ status: 'pending', recipient: 'best_friend' });
+    await sched.tick();
+    expect(env.provider.delivered.map((d) => d.username)).toEqual(['best_friend']);
+    expect(((await u.get(`/api/g/${g.id}`)).json() as PublicGiveawayView).me.prize!.status).toBe('sent');
+    // повторно поменять получателя после отправки нельзя
+    expect((await u.post(`/api/g/${g.id}/claim`, { username: 'other1' })).statusCode).toBe(409);
+    // чужой (не победитель) не может
+    expect((await api(app, env, { id: 999, username: 'x999' }).post(`/api/g/${g.id}/claim`, { username: 'zzzz' })).statusCode).toBe(404);
+  });
+
+  it('Premium уже активен → победитель указывает другой аккаунт', async () => {
+    const { env, app } = s;
+    env.provider.rejects.set('hasprem', new DeliveryError('This user already has Telegram Premium.', 'ineligible'));
+    const { g, sched } = await finishedWith(env, app, [{ id: 701, username: 'hasprem' }], { winnersCount: 1, prizeType: 'premium', prizeAmount: 3 });
+    env.tg.usernames.set(701, 'hasprem');
+    await sched.tick();
+    const u = api(app, env, { id: 701, username: 'hasprem' });
+    expect(((await u.get(`/api/g/${g.id}`)).json() as PublicGiveawayView).me.prize).toMatchObject({ status: 'needs_username', issue: 'ineligible' });
+    // свой аккаунт снова не подойдёт — это видно сразу
+    expect((await u.post(`/api/g/${g.id}/claim`, {})).json().error.message).toMatch(/уже есть Premium/);
+    await u.post(`/api/g/${g.id}/claim`, { username: 'wife_acc' });
+    await sched.tick();
+    expect(env.provider.delivered.at(-1)).toMatchObject({ username: 'wife_acc', type: 'premium' });
+  });
+
+  it('не забрал в срок → напоминание → доразыгрыш тем же протоколом (проверка честности проходит)', async () => {
+    const { env, app } = s;
+    const players = [{ id: 801 }, { id: 802, username: 'p802' }, { id: 803, username: 'p803' }, { id: 804, username: 'p804' }];
+    for (const p of players) if (p.username) env.tg.usernames.set(p.id, p.username);
+    const { g, sched } = await createPaidActive(env, app, { captcha: false, requireSubscription: false, winnersCount: 1 });
+    for (const p of players) expect((await api(app, env, p).post(`/api/g/${g.id}/join`)).statusCode).toBe(200);
+    // детерминированно: подбираем seed, при котором первым выигрывает участник без ника (801)
+    const entries = players.map((p) => ({ p: pseudonym(sha, g.id, p.id), t: 1 }));
+    let seed = '';
+    for (let i = 0; ; i++) {
+      const r = await runDraw({ sha, seed: `seed-${i}`, entropy: 'AbCdEf0123456789', entries, winnersCount: 1 });
+      if (r.winners[0] === pseudonym(sha, g.id, 801)) {
+        seed = `seed-${i}`;
+        break;
+      }
+    }
+    env.ctx.repo.updateGiveaway(g.id, { seed, seed_hash: sha(seed) }, env.clock.t);
+    env.clock.advance(3 * 86_400_000);
+    await sched.tick(); // итоги
+    await sched.tick();
+    expect(env.ctx.repo.getWinner(g.id, 801)).toMatchObject({ status: 'needs_username', issue: 'no_username' });
+    // за сутки до конца срока — напоминание
+    env.clock.advance(6.2 * 86_400_000);
+    await sched.tick();
+    expect(env.tg.sent.some((m) => m.chatId === 801 && m.text.includes('Остались сутки'))).toBe(true);
+    // срок вышел → доразыгрыш → новый победитель получает приз
+    env.clock.advance(1 * 86_400_000);
+    await sched.tick();
+    await sched.tick();
+    const ws = env.ctx.repo.listWinners(g.id);
+    expect(ws.find((w) => w.user_id === 801)!.status).toBe('unclaimed');
+    const fresh = ws.find((w) => w.user_id !== 801)!;
+    expect(fresh.place).toBe(1);
+    expect(env.provider.delivered.map((d) => d.username)).toEqual([env.ctx.repo.getUser(fresh.user_id)!.username]);
+    expect(env.tg.channelPosts().some((p) => p.text.includes('Доразыгрыш'))).toBe(true);
+    expect(env.tg.sent.some((m) => m.chatId === 801 && m.text.includes('разыгран заново'))).toBe(true);
+    const pub = (await api(app, env, { id: 801 }).get(`/api/g/${g.id}`)).json() as PublicGiveawayView;
+    expect(pub.me.isWinner).toBe(false);
+    const proof = (await api(app, env, { id: 802 }).get(`/api/g/${g.id}/proof`)).json() as DrawProof;
+    expect(proof.steps[0]).toMatchObject({ p: pseudonym(sha, g.id, 801), result: 'disqualified', reason: 'unclaimed' });
+    expect((await verifyProof(sha, proof)).ok).toBe(true);
+  });
+
+  it('нет сессии Fragment → попытки не тратятся, админ получает кнопку входа', async () => {
+    const { env, app } = s;
+    env.tg.usernames.set(901, 'p901');
+    env.provider.failNext = new DeliveryError('Fragment: не выполнен вход Telegram', 'auth');
+    const { g, sched } = await finishedWith(env, app, [{ id: 901, username: 'p901' }], { winnersCount: 1 });
+    await sched.tick();
+    const w = env.ctx.repo.getWinner(g.id, 901)!;
+    expect(w).toMatchObject({ status: 'pending', attempts: 0 });
+    const alert = env.tg.sent.find((m) => m.chatId === 1 && m.text.includes('Fragment'))!;
+    expect(JSON.stringify(alert.opts!.reply_markup)).toContain('fraglogin');
+    env.clock.advance(11 * 60_000);
+    await sched.tick();
+    expect(env.provider.delivered.map((d) => d.username)).toEqual(['p901']);
   });
 });
