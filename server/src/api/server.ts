@@ -100,6 +100,7 @@ export async function buildServer(ctx: AppContext, opts: ApiOptions = {}): Promi
 
   app.get('/api/config', async (): Promise<AppConfigView> => ({
     botUsername: ctx.links.botUsername,
+    appLink: ctx.links.app(),
     limits: {
       minStars: cfg.MIN_STARS,
       maxStars: cfg.MAX_STARS,

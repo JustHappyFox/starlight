@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { apiOrigin, del, get, post } from '../api';
 import { navigate } from '../router';
+import { useSession } from '../main';
 import { BackButton, MainButton, Notice, Row, Section, Spinner, usePoll, useNow } from '../ui';
 import { alertMsg, confirmMsg, copyText, haptic, tg } from '../tg';
 import { PRIZE_STATUS, STATUS_LABEL, dateTime, left, prizeLong, usd } from '../format';
@@ -8,20 +9,56 @@ import { countryName, flag } from '../countries';
 import type { GiveawayOwnerView, InvoiceView } from '../../../shared/types';
 import type { TonConnectUI } from '@tonconnect/ui';
 
+/** app_name кошелька Telegram (Wallet → его некастодиальная часть) в реестре TON Connect */
+const TG_WALLET = 'telegram-wallet';
+
 let tonConnect: Promise<TonConnectUI> | null = null;
-function getTonConnect(manifestUrl: string): Promise<TonConnectUI> {
+function getTonConnect(returnUrl: string): Promise<TonConnectUI> {
   if (!tonConnect) {
-    tonConnect = import('@tonconnect/ui').then(({ TonConnectUI }) => new TonConnectUI({ manifestUrl }));
+    tonConnect = import('@tonconnect/ui').then(
+      ({ TonConnectUI }) =>
+        new TonConnectUI({
+          manifestUrl: `${apiOrigin()}/tonconnect-manifest.json`,
+          language: 'ru',
+          // после подтверждения в кошельке пользователь возвращается в мини-апп
+          actionsConfiguration: { returnStrategy: 'back', twaReturnUrl: returnUrl as `${string}://${string}` },
+        }),
+    );
   }
   return tonConnect;
 }
 
+/** Ждём подключения кошелька; reject — если окно закрыли, не подключившись */
+function waitConnected(ui: TonConnectUI, single: boolean): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (ui.connected) return resolve();
+    const stops: (() => void)[] = [];
+    const done = (ok: boolean) => {
+      stops.forEach((f) => f());
+      if (ok) resolve();
+      else reject(new Error('Кошелёк не подключён'));
+    };
+    stops.push(ui.onStatusChange((w) => w && done(true)));
+    const onClosed = (s: { status: string }) => s.status === 'closed' && !ui.connected && done(false);
+    stops.push(single ? ui.onSingleWalletModalStateChange(onClosed) : ui.onModalStateChange(onClosed));
+  });
+}
+
+function walletLabel(ui: TonConnectUI): string | null {
+  const w = ui.wallet as (NonNullable<TonConnectUI['wallet']> & { name?: string }) | null;
+  if (!w) return null;
+  if (w.device.appName === TG_WALLET) return 'Wallet в Telegram';
+  return w.name ?? w.device.appName;
+}
+
 export function Owner(props: { id: string }) {
-    const [g, setG] = useState<GiveawayOwnerView | null>(null);
+  const { config } = useSession();
+  const [g, setG] = useState<GiveawayOwnerView | null>(null);
   const [invoice, setInvoice] = useState<InvoiceView | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [paying, setPaying] = useState(false);
   const [waiting, setWaiting] = useState(false);
+  const [wallet, setWallet] = useState<string | null>(null);
   const now = useNow(15_000);
   const loadedOnce = useRef(false);
 
@@ -41,6 +78,19 @@ export function Owner(props: { id: string }) {
   }, [props.id]);
   usePoll(load, 5000, !!g && (g.status === 'draft' ? waiting || invoice?.status === 'underpaid' : g.status !== 'finished' && g.status !== 'cancelled'));
 
+  // для черновика заранее поднимаем TON Connect: восстанавливаем прошлое подключение кошелька
+  const isDraftNow = g?.status === 'draft';
+  useEffect(() => {
+    if (!isDraftNow) return;
+    let stop: (() => void) | undefined;
+    void getTonConnect(config.appLink).then(async (ui) => {
+      await ui.connectionRestored;
+      setWallet(walletLabel(ui));
+      stop = ui.onStatusChange(() => setWallet(walletLabel(ui)));
+    });
+    return () => stop?.();
+  }, [isDraftNow]);
+
   const ensureInvoice = async (): Promise<InvoiceView> => {
     if (invoice && invoice.status !== 'expired' && invoice.expiresAt - Date.now() > 3 * 60_000) return invoice;
     const inv = await post<InvoiceView>(`/giveaways/${props.id}/invoice`);
@@ -48,30 +98,22 @@ export function Owner(props: { id: string }) {
     return inv;
   };
 
-  const pay = async () => {
+  /**
+   * Быстрая оплата как на Fragment: «Оплатить» → сразу открывается Wallet в Telegram
+   * (без списка кошельков) → подтверждение → возврат в мини-апп.
+   * Первый раз кошелёк подключается (+1 подтверждение), дальше — одно касание.
+   */
+  const pay = async (mode: 'telegram' | 'any') => {
     setPaying(true);
     try {
-      const inv = await ensureInvoice();
-      const due = (BigInt(inv.amountNano) - BigInt(inv.paidNano)).toString();
-      const ui = await getTonConnect(`${apiOrigin()}/tonconnect-manifest.json`);
+      const [inv, ui] = await Promise.all([ensureInvoice(), getTonConnect(config.appLink)]);
+      await ui.connectionRestored;
       if (!ui.connected) {
-        await ui.openModal();
-        await new Promise<void>((resolve, reject) => {
-          const stop = ui.onStatusChange((w) => {
-            if (w) {
-              stop();
-              resolve();
-            }
-          });
-          const stopModal = ui.onModalStateChange((s) => {
-            if (s.status === 'closed' && !ui.connected) {
-              stopModal();
-              stop();
-              reject(new Error('Кошелёк не подключён'));
-            }
-          });
-        });
+        if (mode === 'telegram') await ui.openSingleWalletModal(TG_WALLET);
+        else await ui.openModal();
+        await waitConnected(ui, mode === 'telegram');
       }
+      const due = (BigInt(inv.amountNano) - BigInt(inv.paidNano)).toString();
       await ui.sendTransaction({
         validUntil: Math.floor(Date.now() / 1000) + 600,
         messages: [{ address: inv.address, amount: due, payload: inv.payload }],
@@ -80,10 +122,16 @@ export function Owner(props: { id: string }) {
       setWaiting(true);
     } catch (e) {
       const msg = (e as Error).message || 'Оплата отменена';
-      if (!/отмен|reject|cancel|не подключ/i.test(msg)) await alertMsg(msg);
+      if (!/отмен|reject|cancel|не подключ|declin/i.test(msg)) await alertMsg(msg);
     } finally {
       setPaying(false);
     }
+  };
+
+  const switchWallet = async () => {
+    const ui = await getTonConnect(config.appLink);
+    if (ui.connected) await ui.disconnect();
+    setWallet(null);
   };
 
   const payManually = async () => {
@@ -151,7 +199,12 @@ export function Owner(props: { id: string }) {
           ) : (
             <Row label="Счёт ещё не выставлен" hint="Нажмите «Оплатить» — сумма в TON будет рассчитана по текущему курсу" />
           )}
-          <Row icon="👛" label="Оплатить другим кошельком" hint="Откроется ссылка ton://transfer" onClick={payManually} />
+          {wallet ? (
+            <Row icon="👛" label={`Кошелёк: ${wallet}`} hint="Оплата откроется в нём" right="Сменить" onClick={switchWallet} />
+          ) : (
+            <Row icon="👛" label="Другой кошелёк" hint="Tonkeeper, MyTonWallet и другие" onClick={() => void pay('any')} />
+          )}
+          <Row icon="↗️" label="Перевести вручную" hint="Ссылка ton://transfer — укажите комментарий" onClick={payManually} />
           {waiting && <Notice kind="info">Ждём подтверждения транзакции в сети TON — обычно до минуты…</Notice>}
         </Section>
       )}
@@ -194,7 +247,13 @@ export function Owner(props: { id: string }) {
         </Section>
       )}
 
-      {isDraft && <MainButton text={invoice?.status === 'underpaid' ? 'Доплатить через TON Connect' : 'Оплатить через TON Connect'} onClick={pay} progress={paying} />}
+      {isDraft && (
+        <MainButton
+          text={`${invoice?.status === 'underpaid' ? 'Доплатить' : 'Оплатить'} ${wallet ? (invoice && invoice.status !== 'expired' ? `${invoice.amountTon} TON` : '') : 'в Wallet'}`.trim()}
+          onClick={() => void pay('telegram')}
+          progress={paying}
+        />
+      )}
       {g.status === 'active' && g.postUrl && <MainButton text="Открыть пост" onClick={() => tg.openTelegramLink(g.postUrl!)} />}
     </main>
   );

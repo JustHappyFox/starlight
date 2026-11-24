@@ -139,6 +139,8 @@ export interface MeView {
 
 export interface AppConfigView {
   botUsername: string;
+  /** Ссылка на мини-апп — сюда кошелёк возвращает пользователя после оплаты */
+  appLink: string;
   limits: {
     minStars: number;
     maxStars: number;
