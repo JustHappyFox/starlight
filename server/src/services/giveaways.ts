@@ -266,6 +266,7 @@ export function phaseOf(g: GiveawayRow, now: number): Phase {
   switch (g.status) {
     case 'draft':
       return 'unpaid';
+    case 'paid':
     case 'scheduled':
       return 'upcoming';
     case 'active':

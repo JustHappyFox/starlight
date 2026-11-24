@@ -27,6 +27,7 @@ import {
 } from '../services/giveaways.js';
 import { quote } from '../services/pricing.js';
 import { renderPost } from '../services/post.js';
+import { schedulePublish } from '../services/scheduler.js';
 import { isAdmin } from '../services/notify.js';
 import { RateLimiter } from '../util/rateLimit.js';
 import { handleTx } from '../ton/payments.js';
@@ -181,6 +182,13 @@ export async function buildServer(ctx: AppContext, opts: ApiOptions = {}): Promi
   });
 
   app.post<{ Params: { id: string } }>('/api/giveaways/:id/invoice', async (req) => issueInvoice(ctx, user(req).id, req.params.id));
+
+  // Публикация после оплаты: { at: null } — сейчас, { at: <ms UTC> } — по расписанию
+  app.post<{ Params: { id: string }; Body: { at?: number | null } }>('/api/giveaways/:id/publish', async (req) => {
+    const at = req.body?.at;
+    if (at !== undefined && at !== null && typeof at !== 'number') throw new AppError('bad_request', 'Некорректное время');
+    return ownerView(ctx, await schedulePublish(ctx, user(req).id, req.params.id, at ?? null));
+  });
 
   app.post<{ Params: { id: string } }>('/api/giveaways/:id/preview', async (req) => {
     const g = getOwnGiveaway(ctx, user(req).id, req.params.id);

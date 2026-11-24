@@ -7,6 +7,8 @@ import { parseStartParam } from '../services/links.js';
 import { isAdmin } from '../services/notify.js';
 import { requeueWinner, stuckProcessing } from '../fulfillment/queue.js';
 import { markPaidManually } from '../ton/payments.js';
+import { schedulePublish } from '../services/scheduler.js';
+import { AppError } from '../services/giveaways.js';
 import { escapeHtml } from '../util/html.js';
 import { formatTon } from '../services/pricing.js';
 
@@ -94,6 +96,21 @@ export function registerHandlers(bot: Bot, ctx: AppContext) {
     await c.reply(country === 'XX' ? 'Не удалось определить страну по номеру.' : `Страна подтверждена: ${country}. Вернитесь в приложение.`, {
       reply_markup: { remove_keyboard: true },
     });
+  });
+
+  // «📣 Опубликовать сейчас» из сообщения об оплате
+  bot.callbackQuery(/^pub:([A-Za-z0-9]+)$/, async (c) => {
+    try {
+      const g = await schedulePublish(ctx, c.from.id, c.match[1]!, null);
+      if (g.status === 'active') {
+        await c.answerCallbackQuery({ text: '📣 Опубликовано!' });
+        await c.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => undefined);
+      } else {
+        await c.answerCallbackQuery({ text: g.last_error ? `Не удалось: ${g.last_error}`.slice(0, 190) : 'Публикуем…', show_alert: !!g.last_error });
+      }
+    } catch (e) {
+      await c.answerCallbackQuery({ text: e instanceof AppError ? e.message.slice(0, 190) : 'Ошибка, попробуйте в приложении', show_alert: true });
+    }
   });
 
   bot.callbackQuery(/^claim:([A-Za-z0-9]+)$/, async (c) => {

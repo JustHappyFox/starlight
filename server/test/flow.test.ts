@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { buildServer } from '../src/api/server.js';
 import { onBotMembership } from '../src/bot/channels.js';
-import { startScheduler } from '../src/services/scheduler.js';
+import { publishGiveaway, startScheduler } from '../src/services/scheduler.js';
 import { handleTx } from '../src/ton/payments.js';
 import { verifyProof } from '../../shared/fairness.js';
 import type { DrawProof, GiveawayOwnerView, InvoiceView, PublicGiveawayView } from '../../shared/types.js';
@@ -34,7 +34,8 @@ function api(app: FastifyInstance, env: TestEnv, user: { id: number; username?: 
   };
 }
 
-async function createPaidActive(env: TestEnv, app: FastifyInstance, input: Record<string, unknown> = {}) {
+/** Создать и оплатить: розыгрыш ждёт нажатия «Опубликовать» (статус paid) */
+async function createPaid(env: TestEnv, app: FastifyInstance, input: Record<string, unknown> = {}) {
   const org = api(app, env, CREATOR);
   const created = await org.post('/api/giveaways', baseInput(input));
   expect(created.statusCode, created.body).toBe(200);
@@ -53,6 +54,14 @@ async function createPaidActive(env: TestEnv, app: FastifyInstance, input: Recor
   const sched = startScheduler(env.ctx, { autoStart: false });
   await sched.tick();
   return { g: (await org.get(`/api/giveaways/${g.id}`)).json() as GiveawayOwnerView, sched, org };
+}
+
+/** Создать, оплатить и нажать «Опубликовать сейчас» */
+async function createPaidActive(env: TestEnv, app: FastifyInstance, input: Record<string, unknown> = {}) {
+  const { g, sched, org } = await createPaid(env, app, input);
+  const pub = await org.post(`/api/giveaways/${g.id}/publish`, { at: null });
+  expect(pub.statusCode, pub.body).toBe(200);
+  return { g: pub.json() as GiveawayOwnerView, sched, org };
 }
 
 async function joinWithCaptcha(app: FastifyInstance, env: TestEnv, user: { id: number; username?: string }, gid: string, extra: Record<string, unknown> = {}, startParam?: string) {
@@ -208,7 +217,7 @@ describe('полный сценарий', () => {
     expect(view.invoice!.status).toBe('underpaid');
     await handleTx(env.ctx, { ...tx, hash: 'b', lt: '2', value: BigInt(inv.amountNano) - half });
     view = (await org.get(`/api/giveaways/${g.id}`)).json() as GiveawayOwnerView;
-    expect(view.status).toBe('scheduled');
+    expect(view.status).toBe('paid');
   });
 
   it('без initData — 401, чужой розыгрыш — 404', async () => {
@@ -242,5 +251,95 @@ describe('полный сценарий', () => {
     env.clock.advance(7 * 3_600_000);
     await sched.tick();
     expect(env.provider.delivered.at(-1)!.username).toBe('new501');
+  });
+});
+
+describe('публикация после оплаты', () => {
+  let s: Awaited<ReturnType<typeof setup>>;
+  beforeEach(async () => {
+    s = await setup();
+  });
+
+  it('после оплаты сам не публикуется; в ЛС приходит кнопка «Опубликовать сейчас»', async () => {
+    const { env, app } = s;
+    const { g, sched } = await createPaid(env, app);
+    expect(g.status).toBe('paid');
+    await sched.tick();
+    expect(env.tg.channelPosts()).toHaveLength(0);
+    const msg = env.tg.sent.find((m) => m.chatId === CREATOR.id && m.text.includes('Оплата получена'))!;
+    expect(JSON.stringify(msg.opts!.reply_markup)).toContain(`pub:${g.id}`);
+    // участник видит «скоро начнётся», но участвовать нельзя
+    const v = (await api(app, env, { id: 70, username: 'u70' }).get(`/api/g/${g.id}`)).json() as PublicGiveawayView;
+    expect(v.phase).toBe('upcoming');
+  });
+
+  it('по расписанию: пост выходит в выбранное время; до этого время можно перенести', async () => {
+    const { env, app } = s;
+    const { g, sched, org } = await createPaid(env, app);
+    const at = env.clock.t + 2 * 3_600_000;
+    const r = await org.post(`/api/giveaways/${g.id}/publish`, { at });
+    expect(r.statusCode, r.body).toBe(200);
+    expect(r.json().status).toBe('scheduled');
+    expect(r.json().startsAt).toBe(at);
+    env.clock.advance(3_600_000);
+    await sched.tick();
+    expect(env.tg.channelPosts()).toHaveLength(0);
+    // перенос на +3 часа от текущего момента
+    const later = env.clock.t + 3 * 3_600_000;
+    expect((await org.post(`/api/giveaways/${g.id}/publish`, { at: later })).json().startsAt).toBe(later);
+    env.clock.advance(1.5 * 3_600_000);
+    await sched.tick();
+    expect(env.tg.channelPosts()).toHaveLength(0);
+    env.clock.advance(1.6 * 3_600_000);
+    await sched.tick();
+    expect(env.tg.channelPosts()).toHaveLength(1);
+    expect((await org.get(`/api/giveaways/${g.id}`)).json().status).toBe('active');
+    // после выхода поста — только 409
+    expect((await org.post(`/api/giveaways/${g.id}/publish`, { at: null })).statusCode).toBe(409);
+  });
+
+  it('запланированный можно опубликовать сразу', async () => {
+    const { env, app } = s;
+    const { g, org } = await createPaid(env, app);
+    await org.post(`/api/giveaways/${g.id}/publish`, { at: env.clock.t + 86_400_000 });
+    const now = await org.post(`/api/giveaways/${g.id}/publish`, { at: null });
+    expect(now.json().status).toBe('active');
+    expect(env.tg.channelPosts()).toHaveLength(1);
+  });
+
+  it('проверки времени, оплаты и владельца', async () => {
+    const { env, app } = s;
+    const org = api(app, env, CREATOR);
+    const draft = (await org.post('/api/giveaways', baseInput())).json() as GiveawayOwnerView;
+    expect((await org.post(`/api/giveaways/${draft.id}/publish`, { at: null })).json().error.code).toBe('not_paid');
+    const { g } = await createPaid(env, app);
+    expect((await org.post(`/api/giveaways/${g.id}/publish`, { at: env.clock.t - 3_600_000 })).statusCode).toBe(400);
+    expect((await org.post(`/api/giveaways/${g.id}/publish`, { at: g.endsAt - 60_000 })).json().error.message).toMatch(/до подведения итогов/);
+    expect((await org.post(`/api/giveaways/${g.id}/publish`, { at: 'завтра' })).statusCode).toBe(400);
+    expect((await api(app, env, { id: 77, username: 'x' }).post(`/api/giveaways/${g.id}/publish`, { at: null })).statusCode).toBe(404);
+    expect(env.tg.channelPosts()).toHaveLength(0);
+  });
+
+  it('кнопка и планировщик одновременно — пост один', async () => {
+    const { env, app } = s;
+    const { g, org } = await createPaid(env, app);
+    await org.post(`/api/giveaways/${g.id}/publish`, { at: env.clock.t + 60_000 });
+    env.clock.advance(61_000);
+    const row = env.ctx.repo.getGiveaway(g.id)!;
+    // оба вызова видят статус scheduled до того, как кто-то из них отправил пост
+    const results = await Promise.all([publishGiveaway(env.ctx, row), publishGiveaway(env.ctx, row)]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(env.tg.channelPosts()).toHaveLength(1);
+  });
+
+  it('оплачен, но не опубликован до конца → отмена и возврат', async () => {
+    const { env, app } = s;
+    const { g, sched } = await createPaid(env, app);
+    env.clock.advance(g.endsAt - env.clock.t - 5 * 60_000);
+    await sched.tick();
+    const repo = env.ctx.repo;
+    expect(repo.getGiveaway(g.id)!.status).toBe('cancelled');
+    expect(repo.openRefunds()[0]!.usd_cents).toBe(g.priceUsd * 100);
+    expect(env.tg.channelPosts()).toHaveLength(0);
   });
 });

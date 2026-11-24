@@ -90,8 +90,7 @@ export function Create(props: { editId?: string }) {
   const problems: string[] = [];
   if (!form.channelId) problems.push('выберите канал');
   if (form.countries && form.countries.length === 0) problems.push('выберите хотя бы одну страну');
-  if (form.endsAt - Math.max(Date.now(), form.startsAt ?? 0) < L.minDurationMinutes * 60_000) problems.push('дата окончания слишком близко');
-  if (form.startsAt && form.startsAt < Date.now()) problems.push('дата начала в прошлом');
+  if (form.endsAt - Date.now() < L.minDurationMinutes * 60_000) problems.push('дата окончания слишком близко');
   if (!form.buttonText.trim()) problems.push('текст кнопки пуст');
 
   const save = async () => {
@@ -101,7 +100,7 @@ export function Create(props: { editId?: string }) {
     }
     setSaving(true);
     try {
-      const body = { ...form, countries: form.countries && form.countries.length ? form.countries : null };
+      const body = { ...form, startsAt: null, countries: form.countries && form.countries.length ? form.countries : null };
       const g = props.editId ? await put<GiveawayOwnerView>(`/giveaways/${props.editId}`, body) : await post<GiveawayOwnerView>('/giveaways', body);
       haptic('success');
       navigate(`/my/${g.id}`, true);
@@ -199,16 +198,10 @@ export function Create(props: { editId?: string }) {
         </div>
       </Section>
 
-      <Section title="Сроки" footer={`Часовой пояс: ${form.timezone}. Длительность — от ${L.minDurationMinutes} минут до ${L.maxDurationDays} дней.`}>
-        <Toggle label="Опубликовать сразу после оплаты" checked={form.startsAt === null} onChange={(v) => set('startsAt', v ? null : Date.now() + 3_600_000)} />
-        {form.startsAt !== null && (
-          <label class="row">
-            <span class="row-main">
-              <span class="row-label">Начало</span>
-            </span>
-            <input class="input date" type="datetime-local" value={toLocalInput(form.startsAt)} onInput={(e) => set('startsAt', fromLocalInput((e.currentTarget as HTMLInputElement).value))} />
-          </label>
-        )}
+      <Section
+        title="Сроки"
+        footer={`Время по часам вашего телефона (${form.timezone}). Когда опубликовать пост — сейчас или в выбранное время — спросим после оплаты.`}
+      >
         <label class="row">
           <span class="row-main">
             <span class="row-label">Подведение итогов</span>
@@ -281,6 +274,7 @@ export function Create(props: { editId?: string }) {
       </Section>
 
       <Section title="Как участвуют">
+        <Row icon="0️⃣" label="Вы оплачиваете и жмёте «Опубликовать»" hint="Сразу или в выбранное время" />
         <Row icon="1️⃣" label="Нажимают кнопку под постом" hint={form.captcha ? 'Открывается окно с капчей' : 'Открывается окно розыгрыша'} />
         <Row icon="2️⃣" label="Получают билет и реф-ссылку" hint="Каждый приглашённый друг — +1 билет и выше шанс" />
         <Row icon="3️⃣" label="Бот выбирает победителей" hint="Честно и проверяемо, призы приходят автоматически" />

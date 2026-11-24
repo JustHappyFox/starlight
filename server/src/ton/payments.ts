@@ -66,11 +66,21 @@ export async function handleTx(ctx: AppContext, tx: IncomingTx) {
   const now = ctx.now();
   const ok = ctx.repo.tx(() => {
     ctx.repo.updateInvoice(inv.id, { paid_nano: paid.toString(), status: 'paid', paid_at: now });
-    return ctx.repo.transitionGiveaway(g.id, 'draft', 'scheduled', now, { paid_at: now, last_error: null });
+    return ctx.repo.transitionGiveaway(g.id, 'draft', 'paid', now, { paid_at: now, last_error: null });
   });
   if (!ok) return;
   ctx.log.info({ gid: g.id, invoice: inv.id, nano: paid.toString() }, 'invoice paid');
-  await dm(ctx, g.creator_id, `✅ Оплата получена: ${formatTon(paid)} TON. Розыгрыш <b>${g.id}</b> будет опубликован ${g.starts_at && g.starts_at > now ? 'в назначенное время' : 'в течение минуты'}.`);
+  await dm(
+    ctx,
+    g.creator_id,
+    `✅ Оплата получена: ${formatTon(paid)} TON.\n\nОсталось опубликовать розыгрыш <b>${g.id}</b> — сейчас или в выбранное время.`,
+    {
+      inline_keyboard: [
+        [{ text: '📣 Опубликовать сейчас', callback_data: `pub:${g.id}` }],
+        [{ text: '🗓 Выбрать время', web_app: { url: ctx.links.webApp(`/my/${g.id}`) } }],
+      ],
+    },
+  );
   try {
     await ctx.treasury.onPaymentReceived(paid, `invoice:${inv.id}`);
   } catch (e) {
@@ -85,6 +95,6 @@ export function markPaidManually(ctx: AppContext, gid: string): boolean {
   const inv = ctx.repo.latestInvoice(gid);
   return ctx.repo.tx(() => {
     if (inv) ctx.repo.updateInvoice(inv.id, { status: 'paid', paid_at: now });
-    return ctx.repo.transitionGiveaway(gid, 'draft', 'scheduled', now, { paid_at: now });
+    return ctx.repo.transitionGiveaway(gid, 'draft', 'paid', now, { paid_at: now });
   });
 }

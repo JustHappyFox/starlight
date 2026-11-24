@@ -51,7 +51,8 @@ export function usd(n: number): string {
 
 export const STATUS_LABEL: Record<string, string> = {
   draft: 'Черновик · ждёт оплаты',
-  scheduled: 'Оплачен · ждёт публикации',
+  paid: 'Оплачен · ждёт публикации',
+  scheduled: 'Публикация запланирована',
   active: 'Идёт',
   drawing: 'Подводим итоги',
   finished: 'Завершён',

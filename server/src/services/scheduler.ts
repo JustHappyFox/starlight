@@ -6,19 +6,72 @@ import { processDeliveries } from '../fulfillment/queue.js';
 import { pollPayments } from '../ton/payments.js';
 import { dm, notifyAdmins } from './notify.js';
 import { escapeHtml } from '../util/html.js';
+import { AppError, getOwnGiveaway } from './giveaways.js';
+import { formatDate } from './post.js';
 
-/** Публикация оплаченного розыгрыша в канал */
+/** Оплаченный, но так и не опубликованный розыгрыш: отмена и возврат */
+async function cancelUnpublished(ctx: AppContext, g: GiveawayRow, from: 'paid' | 'scheduled', reason: string) {
+  const now = ctx.now();
+  if (!ctx.repo.transitionGiveaway(g.id, from, 'cancelled', now, { last_error: reason })) return;
+  ctx.repo.insertRefund({ giveaway_id: g.id, reason, usd_cents: g.price_usd_cents }, now);
+  await dm(ctx, g.creator_id, `❌ Розыгрыш <b>${g.id}</b> не опубликован до даты окончания (${escapeHtml(reason)}). Оформлен возврат — поддержка свяжется с вами.`);
+  await notifyAdmins(ctx, `💸 Возврат: ${g.id} не опубликован (${escapeHtml(reason)}). /refunds`);
+}
+
+/**
+ * Организатор после оплаты нажал «Опубликовать»: сейчас (at = null) или в выбранное время
+ * (at — миллисекунды UTC, получены из времени на телефоне организатора).
+ * Можно вызывать повторно, пока пост не вышел: перенести время или опубликовать сразу.
+ */
+export async function schedulePublish(ctx: AppContext, userId: number, gid: string, at: number | null): Promise<GiveawayRow> {
+  const g = getOwnGiveaway(ctx, userId, gid);
+  if (g.status === 'draft') throw new AppError('not_paid', 'Сначала оплатите розыгрыш', 409);
+  if (g.status !== 'paid' && g.status !== 'scheduled') throw new AppError('locked', 'Розыгрыш уже опубликован', 409);
+  const now = ctx.now();
+  if (at !== null && (!Number.isFinite(at) || at < now - 60_000)) throw new AppError('bad_request', 'Это время уже прошло — выберите время в будущем');
+  const when = at === null || at < now ? now : at;
+  const minMs = ctx.cfg.MIN_DURATION_MINUTES * 60_000;
+  if (g.ends_at - when < minMs) {
+    throw new AppError(
+      'bad_request',
+      `Публикация должна быть хотя бы за ${ctx.cfg.MIN_DURATION_MINUTES} мин до подведения итогов (${formatDate(g.ends_at, g.timezone)})`,
+    );
+  }
+  const ch = g.channel_id !== null ? ctx.repo.getChannel(g.channel_id) : undefined;
+  if (!ch?.active || !ch.bot_can_post) throw new AppError('channel_not_ready', 'Бот не может публиковать в канале — проверьте его права администратора');
+  if (!ctx.repo.transitionGiveaway(gid, g.status, 'scheduled', now, { starts_at: when, last_error: null })) {
+    throw new AppError('locked', 'Статус розыгрыша изменился — обновите страницу', 409);
+  }
+  const fresh = ctx.repo.getGiveaway(gid)!;
+  if (when <= now) await publishGiveaway(ctx, fresh);
+  return ctx.repo.getGiveaway(gid)!;
+}
+
+/**
+ * Розыгрыши, которые прямо сейчас отправляются в канал. Кнопка «Опубликовать сейчас» и тик
+ * планировщика могут сработать одновременно — без блокировки в канале появится два поста.
+ */
+const publishing = new Set<string>();
+
+/** Публикация розыгрыша в канал (статус scheduled, время starts_at наступило) */
 export async function publishGiveaway(ctx: AppContext, g: GiveawayRow): Promise<boolean> {
+  if (publishing.has(g.id)) return false;
+  publishing.add(g.id);
+  try {
+    // статус перечитываем под блокировкой: другой вызов мог уже опубликовать
+    const fresh = ctx.repo.getGiveaway(g.id);
+    return fresh ? await publishLocked(ctx, fresh) : false;
+  } finally {
+    publishing.delete(g.id);
+  }
+}
+
+async function publishLocked(ctx: AppContext, g: GiveawayRow): Promise<boolean> {
   const now = ctx.now();
   if (g.status !== 'scheduled') return false;
   if (g.starts_at && g.starts_at > now) return false;
   if (g.ends_at <= now + 60_000) {
-    // не успели опубликовать до конца — возврат
-    if (ctx.repo.transitionGiveaway(g.id, 'scheduled', 'cancelled', now, { last_error: 'не удалось опубликовать до окончания' })) {
-      ctx.repo.insertRefund({ giveaway_id: g.id, reason: 'не опубликован до даты окончания', usd_cents: g.price_usd_cents }, now);
-      await dm(ctx, g.creator_id, `❌ Розыгрыш <b>${g.id}</b> не удалось опубликовать до даты окончания. Оформлен возврат — поддержка свяжется с вами.`);
-      await notifyAdmins(ctx, `💸 Возврат: ${g.id} не опубликован. /refunds`);
-    }
+    await cancelUnpublished(ctx, g, 'scheduled', 'не удалось опубликовать до окончания');
     return false;
   }
   if (g.channel_id === null) return false;
@@ -101,6 +154,11 @@ export function startScheduler(ctx: AppContext, opts: { autoStart?: boolean } = 
       await step('expire-invoices', async () => {
         ctx.repo.db.prepare(`UPDATE invoices SET status = 'expired' WHERE status = 'pending' AND paid_nano = '0' AND expires_at < ?`).run(now);
       });
+      for (const g of ctx.repo.listByStatus('paid')) {
+        // оплачен, но организатор так и не нажал «Опубликовать», а времени уже не хватает
+        if (g.ends_at - ctx.now() < ctx.cfg.MIN_DURATION_MINUTES * 60_000)
+          await step(`expire:${g.id}`, () => cancelUnpublished(ctx, g, 'paid', 'не нажата публикация'));
+      }
       for (const g of ctx.repo.listByStatus('scheduled')) await step(`publish:${g.id}`, () => publishGiveaway(ctx, g));
       for (const g of ctx.repo.listByStatus('active')) {
         if (g.ends_at <= ctx.now()) await step(`draw:${g.id}`, () => drawGiveaway(ctx, g.id));

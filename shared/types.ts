@@ -5,7 +5,8 @@ export type PrizeType = 'stars' | 'premium';
 
 export type GiveawayStatus =
   | 'draft' // создан, не оплачен
-  | 'scheduled' // оплачен, ждёт времени публикации
+  | 'paid' // оплачен, ждёт решения организатора: опубликовать сейчас или по расписанию
+  | 'scheduled' // публикация назначена на starts_at
   | 'active' // опубликован, идёт приём участников
   | 'drawing' // идёт подведение итогов
   | 'finished' // итоги подведены

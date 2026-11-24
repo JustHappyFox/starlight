@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { apiOrigin, del, get, post } from '../api';
 import { navigate } from '../router';
 import { useSession } from '../main';
-import { BackButton, MainButton, Notice, Row, Section, Spinner, usePoll, useNow } from '../ui';
+import { BackButton, MainButton, Notice, Row, Section, Segmented, Spinner, usePoll, useNow } from '../ui';
 import { alertMsg, confirmMsg, copyText, haptic, tg } from '../tg';
-import { PRIZE_STATUS, STATUS_LABEL, dateTime, left, prizeLong, usd } from '../format';
+import { PRIZE_STATUS, STATUS_LABEL, dateTime, fromLocalInput, left, prizeLong, toLocalInput, usd } from '../format';
 import { countryName, flag } from '../countries';
 import type { GiveawayOwnerView, InvoiceView } from '../../../shared/types';
 import type { TonConnectUI } from '@tonconnect/ui';
@@ -59,12 +59,18 @@ export function Owner(props: { id: string }) {
   const [paying, setPaying] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [wallet, setWallet] = useState<string | null>(null);
+  const [pubMode, setPubMode] = useState<'now' | 'later' | null>(null);
+  const [pubAt, setPubAt] = useState<number | null>(null);
+  const [publishing, setPublishing] = useState(false);
   const now = useNow(15_000);
   const loadedOnce = useRef(false);
+  const prevStatus = useRef<string | null>(null);
 
   const load = async () => {
     try {
       const v = await get<GiveawayOwnerView>(`/giveaways/${props.id}`);
+      if (prevStatus.current === 'draft' && v.status === 'paid') haptic('success');
+      prevStatus.current = v.status;
       setG(v);
       if (v.invoice) setInvoice(v.invoice);
       if (v.status !== 'draft') setWaiting(false);
@@ -76,7 +82,8 @@ export function Owner(props: { id: string }) {
   useEffect(() => {
     void load();
   }, [props.id]);
-  usePoll(load, 5000, !!g && (g.status === 'draft' ? waiting || invoice?.status === 'underpaid' : g.status !== 'finished' && g.status !== 'cancelled'));
+  // опрашиваем всегда, пока не завершён: оплату могут прислать вручную из любого кошелька
+  usePoll(load, 5000, !!g && g.status !== 'finished' && g.status !== 'cancelled');
 
   // для черновика заранее поднимаем TON Connect: восстанавливаем прошлое подключение кошелька
   const isDraftNow = g?.status === 'draft';
@@ -154,6 +161,45 @@ export function Owner(props: { id: string }) {
     }
   };
 
+  const minMs = config.limits.minDurationMinutes * 60_000;
+  /** Время по умолчанию для расписания: ближайшие :00/:15/:30/:45 через полчаса, но не позже допустимого */
+  const defaultAt = (v: GiveawayOwnerView) => {
+    if (v.status === 'scheduled' && v.startsAt) return v.startsAt;
+    const q = 15 * 60_000;
+    const t = Math.ceil((Date.now() + 30 * 60_000) / q) * q;
+    return Math.min(t, v.endsAt - minMs);
+  };
+
+  /** «Опубликовать»: сейчас или в выбранное время (часы телефона организатора) */
+  const publish = async () => {
+    if (!g) return;
+    const mode = pubMode ?? (g.status === 'scheduled' ? 'later' : 'now');
+    const at = mode === 'later' ? (pubAt ?? defaultAt(g)) : null;
+    if (at !== null) {
+      if (at < Date.now() + 60_000) return alertMsg('Выберите время в будущем');
+      if (at > g.endsAt - minMs) return alertMsg(`Публикация должна быть не позже чем за ${config.limits.minDurationMinutes} мин до итогов (${dateTime(g.endsAt)})`);
+    }
+    setPublishing(true);
+    try {
+      const v = await post<GiveawayOwnerView>(`/giveaways/${props.id}/publish`, { at });
+      setG(v);
+      prevStatus.current = v.status;
+      setPubMode(null);
+      setPubAt(null);
+      if (v.status === 'active') haptic('success');
+      else if (v.status === 'scheduled' && !v.lastError) {
+        haptic('success');
+        await alertMsg(`Пост выйдет ${dateTime(v.startsAt!)}. Время можно изменить до публикации.`);
+      }
+      if (v.lastError) await alertMsg(`Не удалось опубликовать: ${v.lastError}. Проверьте права бота в канале — повторим автоматически.`);
+    } catch (e) {
+      haptic('error');
+      await alertMsg((e as Error).message);
+    } finally {
+      setPublishing(false);
+    }
+  };
+
   const remove = async () => {
     if (!(await confirmMsg('Удалить черновик?'))) return;
     try {
@@ -173,6 +219,10 @@ export function Owner(props: { id: string }) {
 
   const isDraft = g.status === 'draft';
   const due = invoice ? BigInt(invoice.amountNano) - BigInt(invoice.paidNano) : null;
+  const canPublish = g.status === 'paid' || g.status === 'scheduled';
+  const mode = pubMode ?? (g.status === 'scheduled' ? 'later' : 'now');
+  const at = pubAt ?? defaultAt(g);
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
   return (
     <main class="page">
@@ -209,6 +259,45 @@ export function Owner(props: { id: string }) {
         </Section>
       )}
 
+      {canPublish && (
+        <Section
+          title="Публикация"
+          footer={`Время по часам вашего телефона (${tz}). Опубликовать нужно не позже чем за ${config.limits.minDurationMinutes} мин до итогов — ${dateTime(g.endsAt)}.`}
+        >
+          {g.status === 'paid' && <Notice kind="success">✅ Оплачено. Осталось опубликовать пост в канале «{g.channel?.title}».</Notice>}
+          {g.status === 'scheduled' && g.startsAt && <Row icon="🗓" label="Пост выйдет" right={<b>{dateTime(g.startsAt)}</b>} />}
+          <div class="pad">
+            <Segmented<'now' | 'later'>
+              value={mode}
+              onChange={setPubMode}
+              options={[
+                { value: 'now', label: 'Сейчас' },
+                { value: 'later', label: 'По расписанию' },
+              ]}
+            />
+          </div>
+          {mode === 'later' && (
+            <label class="row">
+              <span class="row-main">
+                <span class="row-label">Дата и время</span>
+              </span>
+              <input
+                class="input date"
+                type="datetime-local"
+                min={toLocalInput(Date.now())}
+                max={toLocalInput(g.endsAt - minMs)}
+                value={toLocalInput(at)}
+                onInput={(e) => {
+                  const v = fromLocalInput((e.currentTarget as HTMLInputElement).value);
+                  if (v) setPubAt(v);
+                }}
+              />
+            </label>
+          )}
+          <Row icon="👁" label="Предпросмотр поста в личку" onClick={preview} />
+        </Section>
+      )}
+
       {g.status === 'active' && (
         <Section title="Идёт розыгрыш">
           <Row label="Участников" right={<b>{g.participantsCount}</b>} />
@@ -230,7 +319,10 @@ export function Owner(props: { id: string }) {
 
       <Section title="Условия">
         <Row label="Канал" right={g.channel?.title ?? '—'} />
-        <Row label="Начало" right={g.startsAt ? dateTime(g.startsAt) : g.publishedAt ? dateTime(g.publishedAt) : 'сразу после оплаты'} />
+        <Row
+          label="Публикация"
+          right={g.publishedAt ? dateTime(g.publishedAt) : g.status === 'scheduled' && g.startsAt ? `в ${dateTime(g.startsAt)}` : 'после оплаты, по кнопке'}
+        />
         <Row label="Итоги" right={dateTime(g.endsAt)} />
         <Row label="Страны" right={g.countries ? g.countries.map((c) => `${flag(c)} ${countryName(c)}`).join(', ') : 'все'} />
         <Row label="Защита" right={[g.captcha && 'капча', g.honeypot && 'ловушка', g.requireSubscription && 'подписка'].filter(Boolean).join(', ') || 'нет'} />
@@ -252,6 +344,13 @@ export function Owner(props: { id: string }) {
           text={`${invoice?.status === 'underpaid' ? 'Доплатить' : 'Оплатить'} ${wallet ? (invoice && invoice.status !== 'expired' ? `${invoice.amountTon} TON` : '') : 'в Wallet'}`.trim()}
           onClick={() => void pay('telegram')}
           progress={paying}
+        />
+      )}
+      {canPublish && (
+        <MainButton
+          text={mode === 'now' ? 'Опубликовать сейчас' : `${g.status === 'scheduled' ? 'Перенести на' : 'Запланировать на'} ${dateTime(at)}`}
+          onClick={() => void publish()}
+          progress={publishing}
         />
       )}
       {g.status === 'active' && g.postUrl && <MainButton text="Открыть пост" onClick={() => tg.openTelegramLink(g.postUrl!)} />}
